@@ -1,15 +1,12 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { 
-  Send, 
-  Box, 
-  Code, 
-  Image as ImageIcon, 
-  Terminal, 
-  Settings, 
-  Layers, 
-  Play, 
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Send,
+  Box,
+  Code,
+  Terminal,
+  Settings,
+  Play,
   Cpu,
-  Activity,
   ChevronRight,
   Plus,
   Search,
@@ -18,22 +15,66 @@ import {
   Monitor,
   Download,
   Copy,
-  Check
+  Check,
+  Pencil,
+  Archive,
+  GitBranch,
+  RotateCcw,
+  Upload
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { ai, BLENDER_TOOLS, SYSTEM_INSTRUCTION } from './services/geminiService';
 import Markdown from 'react-markdown';
+import type { Conversation, Message } from './types/conversation';
+import { loadConversations, saveConversations } from './services/conversationStorage';
+import {
+  conversationToJSON,
+  conversationToMarkdown,
+  downloadTextFile,
+  parseConversationJSON
+} from './services/conversationExport';
 
-interface Message {
-  role: 'user' | 'model' | 'function';
-  content?: string;
-  parts?: any[];
+const DEFAULT_MODEL = 'gemini-2.5-pro';
+
+function createId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
+}
+
+function createWelcomeMessage(): Message {
+  return {
+    id: createId(),
+    role: 'model',
+    content: 'Welcome to Blender AI Studio. I have direct access to your Blender 5.1 instance via Firebase. How can I help you build today?',
+    createdAt: new Date().toISOString()
+  };
+}
+
+function createConversation(title = 'New Conversation'): Conversation {
+  const now = new Date().toISOString();
+  return {
+    id: createId(),
+    title,
+    createdAt: now,
+    updatedAt: now,
+    messages: [createWelcomeMessage()],
+    providerConfig: {
+      model: DEFAULT_MODEL,
+      systemInstruction: SYSTEM_INSTRUCTION
+    },
+    archived: false
+  };
 }
 
 export default function App() {
-  const [messages, setMessages] = useState<Message[]>([
-    { role: 'model', content: 'Welcome to Blender AI Studio. I have direct access to your Blender 5.1 instance via Firebase. How can I help you build today?' }
-  ]);
+  const [conversations, setConversations] = useState<Conversation[]>(() => {
+    const stored = loadConversations();
+    return stored.length ? stored : [createConversation('Untitled Scene')];
+  });
+  const [activeConversationId, setActiveConversationId] = useState<string>(() => {
+    const stored = loadConversations();
+    return stored[0]?.id ?? createConversation('Untitled Scene').id;
+  });
+  const [conversationSearch, setConversationSearch] = useState('');
   const [input, setInput] = useState('');
   const [isBlenderConnected, setIsBlenderConnected] = useState(false);
   const [isTyping, setIsTyping] = useState(false);
@@ -41,10 +82,58 @@ export default function App() {
   const [lastScreenshot, setLastScreenshot] = useState<string | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
   const [pythonCode, setPythonCode] = useState<string>('# Python output will appear here');
-  const [sessionId] = useState(() => Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15));
+  const [sessionId] = useState(() => createId());
   const [copied, setCopied] = useState(false);
-  
+
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const importInputRef = useRef<HTMLInputElement>(null);
+
+  const activeConversation = useMemo(
+    () => conversations.find((conversation) => conversation.id === activeConversationId),
+    [activeConversationId, conversations]
+  );
+
+  const filteredConversations = useMemo(() => {
+    const search = conversationSearch.toLowerCase().trim();
+    return conversations
+      .filter((conversation) => !conversation.archived)
+      .filter((conversation) => (search ? conversation.title.toLowerCase().includes(search) : true))
+      .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+  }, [conversationSearch, conversations]);
+
+  useEffect(() => {
+    saveConversations(conversations);
+  }, [conversations]);
+
+  useEffect(() => {
+    if (activeConversation && activeConversation.archived) {
+      const fallback = conversations.find((conversation) => !conversation.archived);
+      if (fallback) {
+        setActiveConversationId(fallback.id);
+      }
+    }
+  }, [activeConversation, conversations]);
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [activeConversation?.messages, isTyping]);
+
+  const updateConversation = (conversationId: string, updater: (conversation: Conversation) => Conversation) => {
+    setConversations((previous) =>
+      previous.map((conversation) =>
+        conversation.id === conversationId ? updater(conversation) : conversation
+      )
+    );
+  };
+
+  const setMessagesForActive = (messages: Message[]) => {
+    if (!activeConversation) return;
+    updateConversation(activeConversation.id, (conversation) => ({
+      ...conversation,
+      messages,
+      updatedAt: new Date().toISOString()
+    }));
+  };
 
   const agentScript = `import bpy
 import json
@@ -99,7 +188,7 @@ def take_screenshot(mode):
         else:
             old_filepath = bpy.context.scene.render.filepath
             bpy.context.scene.render.filepath = filepath
-            
+
             old_persp = None
             target_area = None
             if mode == "CAMERA":
@@ -109,17 +198,17 @@ def take_screenshot(mode):
                         old_persp = area.spaces.active.region_3d.view_perspective
                         area.spaces.active.region_3d.view_perspective = 'CAMERA'
                         break
-                        
+
             bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
             bpy.ops.render.opengl(write_still=True)
-            
+
             if target_area and old_persp:
                 target_area.spaces.active.region_3d.view_perspective = old_persp
-                
+
             bpy.context.scene.render.filepath = old_filepath
     except Exception as e:
         return {"error": str(e)}
-        
+
     if os.path.exists(filepath):
         with open(filepath, "rb") as f:
             encoded = base64.b64encode(f.read()).decode('utf-8')
@@ -143,34 +232,30 @@ def firebase_worker():
                     "limit": 1
                 }
             }
-            
+
             req = urllib.request.Request(
                 f"https://firestore.googleapis.com/v1/projects/{PROJECT_ID}/databases/{DATABASE_ID}/documents/blender_sessions/{SESSION_ID}:runQuery",
                 data=json.dumps(query).encode('utf-8'),
                 headers={'Content-Type': 'application/json'}
             )
-            
+
             with urllib.request.urlopen(req, timeout=5) as response:
                 res_data = json.loads(response.read().decode('utf-8'))
-                
+
                 for doc_wrapper in res_data:
                     if 'document' in doc_wrapper:
                         doc = doc_wrapper['document']
                         doc_name = doc['name']
                         fields = doc.get('fields', {})
-                        
+
                         tool = fields.get('tool', {}).get('stringValue')
                         args_str = fields.get('args', {}).get('stringValue', '{}')
                         timestamp = fields.get('timestamp')
-                        
+
                         if tool:
-                            # Send to main thread
                             command_queue.put((doc_name, tool, args_str, timestamp))
-                            
-                            # Wait for main thread to finish executing
                             result = result_queue.get()
-                            
-                            # Update Firebase
+
                             update_data = {
                                 "fields": {
                                     "tool": {"stringValue": tool},
@@ -180,7 +265,7 @@ def firebase_worker():
                                     "timestamp": timestamp
                                 }
                             }
-                            
+
                             update_req = urllib.request.Request(
                                 f"https://firestore.googleapis.com/v1/{doc_name}",
                                 data=json.dumps(update_data).encode('utf-8'),
@@ -188,20 +273,19 @@ def firebase_worker():
                                 method='PATCH'
                             )
                             urllib.request.urlopen(update_req)
-                            
-        except Exception as e:
+
+        except Exception:
             pass
-            
+
         time.sleep(1.0)
 
 def process_commands():
     try:
-        # Non-blocking check
         doc_name, tool, args_str, timestamp = command_queue.get_nowait()
-        
+
         args = json.loads(args_str)
         print(f"Executing tool: {tool}")
-        
+
         result = None
         if tool == "execute_python":
             result = execute_python(args.get("code", ""))
@@ -211,14 +295,13 @@ def process_commands():
             result = take_screenshot(args.get("mode", "VIEWPORT"))
         else:
             result = {"error": f"Unknown tool: {tool}"}
-            
+
         result_queue.put(result)
     except queue.Empty:
         pass
-        
-    return 0.1  # Run this fast on the main thread
 
-# Start the background thread if not already running
+    return 0.1
+
 if "_firebase_thread" not in bpy.app.driver_namespace or not bpy.app.driver_namespace["_firebase_thread"].is_alive():
     thread = threading.Thread(target=firebase_worker, daemon=True)
     thread.start()
@@ -230,13 +313,12 @@ if not bpy.app.timers.is_registered(process_commands):
 print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
 `;
 
-  // Listen for completed commands to update connection status
   useEffect(() => {
     import('./firebase').then(({ db }) => {
       import('firebase/firestore').then(({ collection, query, orderBy, onSnapshot }) => {
         const commandsRef = collection(db, 'blender_sessions', sessionId, 'commands');
         const q = query(commandsRef, orderBy('timestamp', 'desc'));
-        
+
         const unsubscribe = onSnapshot(q, (snapshot) => {
           if (!snapshot.empty) {
             setIsBlenderConnected(true);
@@ -249,10 +331,6 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
     });
   }, [sessionId, activeTab]);
 
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
-
   const handleCopyScript = () => {
     navigator.clipboard.writeText(agentScript);
     setCopied(true);
@@ -264,10 +342,10 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
       try {
         const { db } = await import('./firebase');
         const { doc, setDoc, onSnapshot } = await import('firebase/firestore');
-        
+
         const commandId = Math.random().toString(36).substring(2, 15);
         const commandRef = doc(db, 'blender_sessions', sessionId, 'commands', commandId);
-        
+
         await setDoc(commandRef, {
           tool,
           args: JSON.stringify(args),
@@ -275,7 +353,6 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
           timestamp: Date.now()
         });
 
-        // Listen for completion
         const unsubscribe = onSnapshot(commandRef, (docSnap) => {
           const data = docSnap.data();
           if (data && data.status === 'completed') {
@@ -283,139 +360,331 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
             resolve(JSON.parse(data.result));
           } else if (data && data.status === 'error') {
             unsubscribe();
-            resolve({ error: "Command failed in Blender" });
+            resolve({ error: 'Command failed in Blender' });
           }
         });
-        
-        // Timeout after 30 seconds
+
         setTimeout(() => {
           unsubscribe();
-          resolve({ error: "Command timed out. Is Blender running?" });
+          resolve({ error: 'Command timed out. Is Blender running?' });
         }, 30000);
-        
       } catch (e) {
-        console.error("Failed to execute tool via Firebase:", e);
-        resolve({ error: "Failed to connect to Firebase Bridge." });
+        console.error('Failed to execute tool via Firebase:', e);
+        resolve({ error: 'Failed to connect to Firebase Bridge.' });
       }
     });
   };
 
-  const handleSend = async () => {
-    if (!input.trim() || isTyping) return;
+  const generateAssistantReply = async (historyMessages: Message[]) => {
+    let currentHistory: any[] = historyMessages
+      .filter((message) => message.content || message.parts)
+      .map((message) => {
+        if (message.parts) return { role: message.role, parts: message.parts };
+        return { role: message.role, parts: [{ text: message.content }] };
+      });
 
-    const userMsg: Message = { role: 'user', content: input };
-    setMessages(prev => [...prev, userMsg]);
+    let response = await ai.models.generateContent({
+      model: activeConversation?.providerConfig.model || DEFAULT_MODEL,
+      contents: currentHistory,
+      config: {
+        systemInstruction: activeConversation?.providerConfig.systemInstruction || SYSTEM_INSTRUCTION,
+        tools: [{ functionDeclarations: BLENDER_TOOLS }]
+      }
+    });
+
+    while (response.functionCalls && response.functionCalls.length > 0) {
+      const functionResponses = [];
+
+      currentHistory.push({
+        role: 'model',
+        parts: response.functionCalls.map((call) => ({ functionCall: call }))
+      });
+
+      for (const call of response.functionCalls) {
+        if (call.name === 'execute_python') {
+          setPythonCode((call.args as any).code);
+          setActiveTab('code');
+        }
+
+        const result = await executeToolInBlender(call.name, call.args);
+
+        if (call.name === 'take_screenshot' && (result as any)?.image) {
+          setLastScreenshot((result as any).image);
+          setActiveTab('viewport');
+        }
+        if (call.name === 'execute_python' && (result as any)?.output) {
+          setLogs((previous) => [...previous, (result as any).output].slice(-50));
+        }
+
+        functionResponses.push({
+          functionResponse: {
+            name: call.name,
+            response: result
+          }
+        });
+      }
+
+      currentHistory.push({
+        role: 'function',
+        parts: functionResponses
+      });
+
+      response = await ai.models.generateContent({
+        model: activeConversation?.providerConfig.model || DEFAULT_MODEL,
+        contents: currentHistory,
+        config: {
+          systemInstruction: activeConversation?.providerConfig.systemInstruction || SYSTEM_INSTRUCTION,
+          tools: [{ functionDeclarations: BLENDER_TOOLS }]
+        }
+      });
+    }
+
+    if (!response.text) {
+      return {
+        id: createId(),
+        role: 'model',
+        content: 'No response text was generated.',
+        createdAt: new Date().toISOString()
+      } satisfies Message;
+    }
+
+    return {
+      id: createId(),
+      role: 'model',
+      content: response.text,
+      createdAt: new Date().toISOString()
+    } satisfies Message;
+  };
+
+  const handleSend = async () => {
+    if (!input.trim() || isTyping || !activeConversation) return;
+
+    const userMessage: Message = {
+      id: createId(),
+      role: 'user',
+      content: input,
+      createdAt: new Date().toISOString()
+    };
+
+    const nextMessages = [...activeConversation.messages, userMessage];
+    setMessagesForActive(nextMessages);
     setInput('');
     setIsTyping(true);
 
     try {
-      let currentHistory: any[] = messages
-        .filter(m => m.content || m.parts)
-        .map(m => {
-          if (m.parts) return { role: m.role, parts: m.parts };
-          return { role: m.role, parts: [{ text: m.content }] };
-        });
-        
-      currentHistory.push({ role: 'user', parts: [{ text: input }] });
-
-      let response = await ai.models.generateContent({
-        model: "gemini-2.5-pro",
-        contents: currentHistory,
-        config: {
-          systemInstruction: SYSTEM_INSTRUCTION,
-          tools: [{ functionDeclarations: BLENDER_TOOLS }]
-        }
-      });
-      
-      while (response.functionCalls && response.functionCalls.length > 0) {
-        const functionResponses = [];
-        
-        // Append the model's function calls to history
-        currentHistory.push({
-          role: 'model',
-          parts: response.functionCalls.map(call => ({ functionCall: call }))
-        });
-        
-        for (const call of response.functionCalls) {
-          if (call.name === 'execute_python') {
-            setPythonCode((call.args as any).code);
-            setActiveTab('code');
-          }
-          
-          const result = await executeToolInBlender(call.name, call.args);
-          
-          if (call.name === 'take_screenshot' && result?.image) {
-             setLastScreenshot(result.image);
-             setActiveTab('viewport');
-          }
-          if (call.name === 'execute_python' && result?.output) {
-             setLogs(prev => [...prev, result.output].slice(-50));
-          }
-          
-          functionResponses.push({
-            functionResponse: {
-              name: call.name,
-              response: result
-            }
-          });
-        }
-        
-        // Append the function responses to history
-        currentHistory.push({
-          role: 'function',
-          parts: functionResponses
-        });
-        
-        // Call Gemini again with the results
-        response = await ai.models.generateContent({
-          model: "gemini-2.5-pro",
-          contents: currentHistory,
-          config: {
-            systemInstruction: SYSTEM_INSTRUCTION,
-            tools: [{ functionDeclarations: BLENDER_TOOLS }]
-          }
-        });
-      }
-
-      if (response.text) {
-        setMessages(prev => [...prev, { role: 'model', content: response.text }]);
-      }
+      const assistantMessage = await generateAssistantReply(nextMessages);
+      setMessagesForActive([...nextMessages, assistantMessage]);
     } catch (error) {
       console.error(error);
-      setMessages(prev => [...prev, { role: 'model', content: 'Error connecting to Gemini or Blender.' }]);
+      setMessagesForActive([
+        ...nextMessages,
+        {
+          id: createId(),
+          role: 'model',
+          content: 'Error connecting to Gemini or Blender.',
+          createdAt: new Date().toISOString()
+        }
+      ]);
     } finally {
       setIsTyping(false);
     }
   };
 
+  const handleCreateConversation = () => {
+    const newConversation = createConversation(`Conversation ${conversations.length + 1}`);
+    setConversations((previous) => [newConversation, ...previous]);
+    setActiveConversationId(newConversation.id);
+  };
+
+  const handleRenameConversation = (conversationId: string) => {
+    const current = conversations.find((conversation) => conversation.id === conversationId);
+    const title = prompt('Rename conversation', current?.title || '');
+    if (!title?.trim()) return;
+
+    updateConversation(conversationId, (conversation) => ({
+      ...conversation,
+      title: title.trim(),
+      updatedAt: new Date().toISOString()
+    }));
+  };
+
+  const handleArchiveConversation = (conversationId: string) => {
+    updateConversation(conversationId, (conversation) => ({
+      ...conversation,
+      archived: true,
+      updatedAt: new Date().toISOString()
+    }));
+  };
+
+  const branchFromMessage = (messageIndex: number) => {
+    if (!activeConversation) return;
+    const branchMessages = activeConversation.messages.slice(0, messageIndex + 1);
+    const now = new Date().toISOString();
+    const branchedConversation: Conversation = {
+      ...activeConversation,
+      id: createId(),
+      title: `${activeConversation.title} (branch)`,
+      createdAt: now,
+      updatedAt: now,
+      messages: branchMessages.map((message) => ({ ...message, id: createId() })),
+      archived: false
+    };
+    setConversations((previous) => [branchedConversation, ...previous]);
+    setActiveConversationId(branchedConversation.id);
+  };
+
+  const rewindAndRegenerateFromMessage = async (messageIndex: number) => {
+    if (!activeConversation || isTyping) return;
+
+    const targetMessage = activeConversation.messages[messageIndex];
+    if (!targetMessage) return;
+
+    let baseMessages = activeConversation.messages.slice(0, messageIndex + 1);
+
+    if (targetMessage.role === 'model') {
+      baseMessages = activeConversation.messages.slice(0, messageIndex);
+    }
+
+    const lastMessage = baseMessages[baseMessages.length - 1];
+    if (!lastMessage || lastMessage.role !== 'user') {
+      setMessagesForActive(baseMessages);
+      return;
+    }
+
+    setMessagesForActive(baseMessages);
+    setIsTyping(true);
+
+    try {
+      const assistantMessage = await generateAssistantReply(baseMessages);
+      setMessagesForActive([...baseMessages, assistantMessage]);
+    } catch (error) {
+      console.error(error);
+      setMessagesForActive([
+        ...baseMessages,
+        {
+          id: createId(),
+          role: 'model',
+          content: 'Regeneration failed.',
+          createdAt: new Date().toISOString()
+        }
+      ]);
+    } finally {
+      setIsTyping(false);
+    }
+  };
+
+  const handleExportJSON = () => {
+    if (!activeConversation) return;
+    downloadTextFile(`${activeConversation.title}.json`, conversationToJSON(activeConversation), 'application/json');
+  };
+
+  const handleExportMarkdown = () => {
+    if (!activeConversation) return;
+    downloadTextFile(`${activeConversation.title}.md`, conversationToMarkdown(activeConversation), 'text/markdown');
+  };
+
+  const handleImportConversation = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const text = await file.text();
+    const imported = parseConversationJSON(text);
+    const normalized: Conversation = {
+      ...imported,
+      id: createId(),
+      title: imported.title || 'Imported Conversation',
+      createdAt: imported.createdAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      messages: (imported.messages || []).map((message) => ({
+        ...message,
+        id: message.id || createId(),
+        createdAt: message.createdAt || new Date().toISOString()
+      })),
+      providerConfig: imported.providerConfig || {
+        model: DEFAULT_MODEL,
+        systemInstruction: SYSTEM_INSTRUCTION
+      },
+      archived: false
+    };
+
+    setConversations((previous) => [normalized, ...previous]);
+    setActiveConversationId(normalized.id);
+    event.target.value = '';
+  };
+
+  const activeMessages = activeConversation?.messages || [];
+
   return (
     <div className="flex h-screen bg-[#0a0a0a] text-[#e0e0e0] font-sans overflow-hidden">
-      {/* Sidebar */}
-      <div className="w-64 border-r border-[#222] flex flex-col bg-[#0f0f0f]">
+      <div className="w-80 border-r border-[#222] flex flex-col bg-[#0f0f0f]">
         <div className="p-4 flex items-center gap-2 border-b border-[#222]">
           <div className="w-8 h-8 bg-[#3b82f6] rounded flex items-center justify-center">
             <Box className="text-white w-5 h-5" />
           </div>
           <span className="font-semibold tracking-tight">Blender AI Studio</span>
         </div>
-        
-        <div className="flex-1 overflow-y-auto py-4">
-          <div className="px-4 mb-6">
-            <button className="w-full py-2 px-4 bg-[#1a1a1a] hover:bg-[#252525] border border-[#333] rounded-md flex items-center gap-2 text-sm transition-colors">
-              <Plus className="w-4 h-4" />
-              New Project
-            </button>
-          </div>
 
-          <nav className="space-y-1 px-2">
-            <SidebarItem icon={<Monitor className="w-4 h-4" />} label="Viewport" active={activeTab === 'viewport'} onClick={() => setActiveTab('viewport')} />
-            <SidebarItem icon={<Code className="w-4 h-4" />} label="Scripting" active={activeTab === 'code'} onClick={() => setActiveTab('code')} />
-            <SidebarItem icon={<Terminal className="w-4 h-4" />} label="Console" active={activeTab === 'logs'} onClick={() => setActiveTab('logs')} />
-            <SidebarItem icon={<Settings className="w-4 h-4" />} label="Setup" active={activeTab === 'setup'} onClick={() => setActiveTab('setup')} />
-          </nav>
+        <div className="p-4 border-b border-[#222] space-y-3">
+          <button
+            onClick={handleCreateConversation}
+            className="w-full py-2 px-4 bg-[#1a1a1a] hover:bg-[#252525] border border-[#333] rounded-md flex items-center gap-2 text-sm transition-colors"
+          >
+            <Plus className="w-4 h-4" />
+            New Conversation
+          </button>
+          <div className="relative">
+            <Search className="w-4 h-4 absolute left-3 top-2.5 text-[#666]" />
+            <input
+              value={conversationSearch}
+              onChange={(event) => setConversationSearch(event.target.value)}
+              placeholder="Quick switch / search"
+              className="w-full bg-[#111] border border-[#2a2a2a] rounded-md pl-9 pr-3 py-2 text-sm outline-none focus:border-[#3b82f6]"
+            />
+          </div>
         </div>
 
-        <div className="p-4 border-t border-[#222] space-y-4">
+        <div className="flex-1 overflow-y-auto py-2 px-2 space-y-1">
+          {filteredConversations.map((conversation) => (
+            <div
+              key={conversation.id}
+              className={`group rounded-md border px-2 py-2 ${
+                conversation.id === activeConversationId
+                  ? 'bg-[#1a1a1a] border-[#3b82f6]/50'
+                  : 'bg-transparent border-transparent hover:bg-[#161616]'
+              }`}
+            >
+              <button className="w-full text-left" onClick={() => setActiveConversationId(conversation.id)}>
+                <div className="text-sm font-medium truncate">{conversation.title}</div>
+                <div className="text-[11px] text-[#666]">{new Date(conversation.updatedAt).toLocaleString()}</div>
+              </button>
+              <div className="hidden group-hover:flex items-center gap-1 mt-2">
+                <button className="p-1 hover:bg-[#222] rounded" onClick={() => handleRenameConversation(conversation.id)}>
+                  <Pencil className="w-3.5 h-3.5" />
+                </button>
+                <button className="p-1 hover:bg-[#222] rounded" onClick={() => handleArchiveConversation(conversation.id)}>
+                  <Archive className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div className="p-4 border-t border-[#222] space-y-3">
+          <div className="grid grid-cols-2 gap-2 text-xs">
+            <button onClick={handleExportJSON} className="p-2 rounded bg-[#1a1a1a] hover:bg-[#222] flex items-center gap-2 justify-center">
+              <Download className="w-3.5 h-3.5" /> JSON
+            </button>
+            <button onClick={handleExportMarkdown} className="p-2 rounded bg-[#1a1a1a] hover:bg-[#222] flex items-center gap-2 justify-center">
+              <Download className="w-3.5 h-3.5" /> Markdown
+            </button>
+            <button
+              onClick={() => importInputRef.current?.click()}
+              className="col-span-2 p-2 rounded bg-[#1a1a1a] hover:bg-[#222] flex items-center gap-2 justify-center"
+            >
+              <Upload className="w-3.5 h-3.5" /> Import Conversation
+            </button>
+            <input ref={importInputRef} type="file" accept=".json" className="hidden" onChange={handleImportConversation} />
+          </div>
           <div className="flex items-center justify-between text-xs text-[#888]">
             <div className="flex items-center gap-2">
               <div className={`w-2 h-2 rounded-full ${isBlenderConnected ? 'bg-green-500' : 'bg-red-500'}`} />
@@ -435,21 +704,16 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
         </div>
       </div>
 
-      {/* Main Content */}
       <div className="flex-1 flex flex-col min-w-0">
-        {/* Header */}
         <header className="h-14 border-b border-[#222] flex items-center justify-between px-6 bg-[#0f0f0f]">
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-2 text-sm text-[#888]">
-              <span>Projects</span>
+              <span>Conversations</span>
               <ChevronRight className="w-4 h-4" />
-              <span className="text-[#e0e0e0] font-medium">Untitled Scene</span>
+              <span className="text-[#e0e0e0] font-medium">{activeConversation?.title || 'Untitled Scene'}</span>
             </div>
           </div>
           <div className="flex items-center gap-3">
-            <button className="p-2 hover:bg-[#222] rounded-md transition-colors">
-              <Search className="w-4 h-4" />
-            </button>
             <button className="bg-[#3b82f6] hover:bg-[#2563eb] text-white px-4 py-1.5 rounded-md text-sm font-medium transition-colors flex items-center gap-2">
               <Play className="w-4 h-4" />
               Render
@@ -457,29 +721,43 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
           </div>
         </header>
 
-        {/* Workspace */}
         <div className="flex-1 flex overflow-hidden">
-          {/* Chat Panel */}
-          <div className="w-[450px] flex flex-col border-r border-[#222] bg-[#0a0a0a]">
+          <div className="w-[500px] flex flex-col border-r border-[#222] bg-[#0a0a0a]">
             <div className="flex-1 overflow-y-auto p-6 space-y-6 scrollbar-hide">
-              {messages.map((msg, i) => {
-                if (!msg.content) return null;
+              {activeMessages.map((message, index) => {
+                if (!message.content) return null;
                 return (
-                  <div key={i} className={`flex gap-4 ${msg.role === 'user' ? 'justify-end' : ''}`}>
-                    {msg.role === 'model' && (
+                  <div key={message.id} className={`group flex gap-4 ${message.role === 'user' ? 'justify-end' : ''}`}>
+                    {message.role === 'model' && (
                       <div className="w-8 h-8 rounded-full bg-[#3b82f6]/10 flex items-center justify-center flex-shrink-0">
                         <Sparkles className="w-4 h-4 text-[#3b82f6]" />
                       </div>
                     )}
-                    <div className={`max-w-[85%] rounded-2xl p-4 text-sm leading-relaxed ${
-                      msg.role === 'user' 
-                        ? 'bg-[#3b82f6] text-white' 
-                        : 'bg-[#1a1a1a] border border-[#333] text-[#e0e0e0]'
-                    }`}>
-                      <div className="prose prose-invert prose-sm max-w-none">
-                        <Markdown>
-                          {msg.content}
-                        </Markdown>
+                    <div className="max-w-[90%] space-y-2">
+                      <div
+                        className={`rounded-2xl p-4 text-sm leading-relaxed ${
+                          message.role === 'user'
+                            ? 'bg-[#3b82f6] text-white'
+                            : 'bg-[#1a1a1a] border border-[#333] text-[#e0e0e0]'
+                        }`}
+                      >
+                        <div className="prose prose-invert prose-sm max-w-none">
+                          <Markdown>{message.content}</Markdown>
+                        </div>
+                      </div>
+                      <div className="hidden group-hover:flex gap-2 justify-end text-xs">
+                        <button
+                          onClick={() => branchFromMessage(index)}
+                          className="px-2 py-1 rounded bg-[#151515] hover:bg-[#222] border border-[#2b2b2b] flex items-center gap-1"
+                        >
+                          <GitBranch className="w-3 h-3" /> Branch from here
+                        </button>
+                        <button
+                          onClick={() => rewindAndRegenerateFromMessage(index)}
+                          className="px-2 py-1 rounded bg-[#151515] hover:bg-[#222] border border-[#2b2b2b] flex items-center gap-1"
+                        >
+                          <RotateCcw className="w-3 h-3" /> Rewind / regenerate
+                        </button>
                       </div>
                     </div>
                   </div>
@@ -504,12 +782,12 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
               <div className="relative">
                 <textarea
                   value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), handleSend())}
+                  onChange={(event) => setInput(event.target.value)}
+                  onKeyDown={(event) => event.key === 'Enter' && !event.shiftKey && (event.preventDefault(), handleSend())}
                   placeholder="Ask Gemini to build in Blender..."
                   className="w-full bg-[#1a1a1a] border border-[#333] rounded-xl py-3 pl-4 pr-12 text-sm focus:outline-none focus:border-[#3b82f6] transition-colors resize-none min-h-[100px]"
                 />
-                <button 
+                <button
                   onClick={handleSend}
                   disabled={!input.trim() || isTyping}
                   className="absolute right-3 bottom-3 p-2 bg-[#3b82f6] disabled:bg-[#222] text-white rounded-lg transition-all hover:scale-105 active:scale-95"
@@ -523,52 +801,20 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
             </div>
           </div>
 
-          {/* Preview Panel */}
           <div className="flex-1 flex flex-col bg-[#050505]">
             <div className="flex items-center gap-1 p-2 border-b border-[#222] bg-[#0f0f0f]">
-              <TabButton 
-                active={activeTab === 'viewport'} 
-                onClick={() => setActiveTab('viewport')}
-                icon={<Monitor className="w-3.5 h-3.5" />}
-                label="Viewport"
-              />
-              <TabButton 
-                active={activeTab === 'code'} 
-                onClick={() => setActiveTab('code')}
-                icon={<Code className="w-3.5 h-3.5" />}
-                label="Script"
-              />
-              <TabButton 
-                active={activeTab === 'logs'} 
-                onClick={() => setActiveTab('logs')}
-                icon={<Terminal className="w-3.5 h-3.5" />}
-                label="Console"
-              />
-              <TabButton 
-                active={activeTab === 'setup'} 
-                onClick={() => setActiveTab('setup')}
-                icon={<Settings className="w-3.5 h-3.5" />}
-                label="Setup"
-              />
+              <TabButton active={activeTab === 'viewport'} onClick={() => setActiveTab('viewport')} icon={<Monitor className="w-3.5 h-3.5" />} label="Viewport" />
+              <TabButton active={activeTab === 'code'} onClick={() => setActiveTab('code')} icon={<Code className="w-3.5 h-3.5" />} label="Script" />
+              <TabButton active={activeTab === 'logs'} onClick={() => setActiveTab('logs')} icon={<Terminal className="w-3.5 h-3.5" />} label="Console" />
+              <TabButton active={activeTab === 'setup'} onClick={() => setActiveTab('setup')} icon={<Settings className="w-3.5 h-3.5" />} label="Setup" />
             </div>
 
             <div className="flex-1 relative overflow-hidden">
               <AnimatePresence mode="wait">
                 {activeTab === 'viewport' && (
-                  <motion.div 
-                    key="viewport"
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    exit={{ opacity: 0 }}
-                    className="absolute inset-0 flex items-center justify-center p-8"
-                  >
+                  <motion.div key="viewport" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="absolute inset-0 flex items-center justify-center p-8">
                     {lastScreenshot ? (
-                      <img 
-                        src={lastScreenshot} 
-                        alt="Blender Viewport" 
-                        className="max-w-full max-h-full rounded-lg border border-[#333] shadow-2xl"
-                        referrerPolicy="no-referrer"
-                      />
+                      <img src={lastScreenshot} alt="Blender Viewport" className="max-w-full max-h-full rounded-lg border border-[#333] shadow-2xl" referrerPolicy="no-referrer" />
                     ) : (
                       <div className="text-center space-y-4">
                         <div className="w-20 h-20 bg-[#111] rounded-full flex items-center justify-center mx-auto border border-[#222]">
@@ -581,13 +827,7 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
                 )}
 
                 {activeTab === 'code' && (
-                  <motion.div 
-                    key="code"
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    exit={{ opacity: 0 }}
-                    className="absolute inset-0 p-6 font-mono text-sm overflow-auto bg-[#0a0a0a]"
-                  >
+                  <motion.div key="code" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="absolute inset-0 p-6 font-mono text-sm overflow-auto bg-[#0a0a0a]">
                     <pre className="text-[#3b82f6]">
                       <code>{pythonCode}</code>
                     </pre>
@@ -595,16 +835,10 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
                 )}
 
                 {activeTab === 'logs' && (
-                  <motion.div 
-                    key="logs"
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    exit={{ opacity: 0 }}
-                    className="absolute inset-0 p-6 font-mono text-xs overflow-auto bg-[#0a0a0a]"
-                  >
+                  <motion.div key="logs" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="absolute inset-0 p-6 font-mono text-xs overflow-auto bg-[#0a0a0a]">
                     {logs.length > 0 ? (
-                      logs.map((log, i) => (
-                        <div key={i} className="mb-1 text-[#888]">
+                      logs.map((log, index) => (
+                        <div key={`${log}-${index}`} className="mb-1 text-[#888]">
                           <span className="text-[#444] mr-2">[{new Date().toLocaleTimeString()}]</span>
                           {log}
                         </div>
@@ -616,13 +850,7 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
                 )}
 
                 {activeTab === 'setup' && (
-                  <motion.div 
-                    key="setup"
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    exit={{ opacity: 0 }}
-                    className="absolute inset-0 p-8 overflow-auto bg-[#0a0a0a]"
-                  >
+                  <motion.div key="setup" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="absolute inset-0 p-8 overflow-auto bg-[#0a0a0a]">
                     <div className="max-w-2xl mx-auto space-y-6">
                       <div className="flex items-center gap-4 border-b border-[#222] pb-6">
                         <div className="w-12 h-12 bg-[#3b82f6]/10 rounded-xl flex items-center justify-center">
@@ -651,26 +879,15 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
 
                       <div className="relative">
                         <div className="absolute top-4 right-4 flex gap-2">
-                          <button 
-                            onClick={handleCopyScript}
-                            className="p-2 bg-[#222] hover:bg-[#333] rounded-md transition-colors text-[#e0e0e0] flex items-center gap-2"
-                            title="Copy Script"
-                          >
+                          <button onClick={handleCopyScript} className="p-2 bg-[#222] hover:bg-[#333] rounded-md transition-colors text-[#e0e0e0] flex items-center gap-2" title="Copy Script">
                             {copied ? <Check className="w-4 h-4 text-green-500" /> : <Copy className="w-4 h-4" />}
                             <span className="text-xs font-medium">{copied ? 'Copied!' : 'Copy'}</span>
                           </button>
-                          <a 
-                            href="/api/agent-script" 
-                            download="blender_agent.py"
-                            className="p-2 bg-[#222] hover:bg-[#333] rounded-md transition-colors text-[#e0e0e0]"
-                            title="Download Script"
-                          >
+                          <a href="/api/agent-script" download="blender_agent.py" className="p-2 bg-[#222] hover:bg-[#333] rounded-md transition-colors text-[#e0e0e0]" title="Download Script">
                             <Download className="w-4 h-4" />
                           </a>
                         </div>
-                        <pre className="bg-[#111] border border-[#222] rounded-xl p-6 overflow-x-auto text-xs font-mono text-[#a8b2c1] max-h-[400px] overflow-y-auto">
-{agentScript}
-                        </pre>
+                        <pre className="bg-[#111] border border-[#222] rounded-xl p-6 overflow-x-auto text-xs font-mono text-[#a8b2c1] max-h-[400px] overflow-y-auto">{agentScript}</pre>
                       </div>
                     </div>
                   </motion.div>
@@ -684,28 +901,12 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
   );
 }
 
-function SidebarItem({ icon, label, active = false, onClick }: { icon: React.ReactNode, label: string, active?: boolean, onClick?: () => void }) {
+function TabButton({ active, onClick, icon, label }: { active: boolean; onClick: () => void; icon: React.ReactNode; label: string }) {
   return (
-    <button 
-      onClick={onClick}
-      className={`w-full flex items-center gap-3 px-3 py-2 rounded-md text-sm transition-colors ${
-        active ? 'bg-[#3b82f6]/10 text-[#3b82f6]' : 'text-[#888] hover:bg-[#1a1a1a] hover:text-[#e0e0e0]'
-      }`}
-    >
-      {icon}
-      <span className="font-medium">{label}</span>
-    </button>
-  );
-}
-
-function TabButton({ active, onClick, icon, label }: { active: boolean, onClick: () => void, icon: React.ReactNode, label: string }) {
-  return (
-    <button 
+    <button
       onClick={onClick}
       className={`flex items-center gap-2 px-4 py-1.5 rounded-md text-xs font-medium transition-all ${
-        active 
-          ? 'bg-[#1a1a1a] text-[#e0e0e0] border border-[#333]' 
-          : 'text-[#666] hover:text-[#888]'
+        active ? 'bg-[#1a1a1a] text-[#e0e0e0] border border-[#333]' : 'text-[#666] hover:text-[#888]'
       }`}
     >
       {icon}
