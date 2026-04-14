@@ -1,6 +1,5 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
-  Send, 
   Box, 
   Code, 
   Image as ImageIcon, 
@@ -14,7 +13,6 @@ import {
   Plus,
   Search,
   User,
-  Sparkles,
   Monitor,
   Download,
   Copy,
@@ -23,10 +21,18 @@ import {
   EyeOff
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { ai, BLENDER_TOOLS, SYSTEM_INSTRUCTION } from './services/geminiService';
-import Markdown from 'react-markdown';
-import { ProviderId, PROVIDER_DEFINITIONS } from './services/providerConfig';
-import { hydrateProviderSettings, persistProviderSettings, validateProviderSettings } from './services/providerSettingsService';
+import {
+  BLENDER_TOOLS,
+  SYSTEM_INSTRUCTION,
+  MODEL_PRESETS,
+  ProviderConfig,
+  generateLlmContent,
+  discoverLmStudio
+} from './services/llmService';
+import { ChatSurface } from './components/chat/ChatSurface';
+import { sanitizeToolPayload } from './components/chat/adapters';
+import { PROVIDER_DEFINITIONS } from './services/providerConfig';
+import { persistProviderSettings, validateProviderSettings } from './services/providerSettingsService';
 
 interface Message {
   role: 'user' | 'model' | 'function';
@@ -46,10 +52,6 @@ type ToastState = {
 } | null;
 
 export default function App() {
-  const [provider, setProvider] = useState<ProviderId>(() => hydrateProviderSettings().provider);
-  const [model, setModel] = useState(() => hydrateProviderSettings().model);
-  const [baseUrl, setBaseUrl] = useState(() => hydrateProviderSettings().baseUrl);
-  const [apiKey, setApiKey] = useState('');
   const [showApiKey, setShowApiKey] = useState(false);
   const [providerErrors, setProviderErrors] = useState<ProviderErrors>({});
   const [isTestingProvider, setIsTestingProvider] = useState(false);
@@ -59,7 +61,6 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([
     { role: 'model', content: 'Welcome to Blender AI Studio. I have direct access to your Blender 5.1 instance via Firebase. How can I help you build today?' }
   ]);
-  const [input, setInput] = useState('');
   const [isBlenderConnected, setIsBlenderConnected] = useState(false);
   const [isTyping, setIsTyping] = useState(false);
   const [activeTab, setActiveTab] = useState<'viewport' | 'code' | 'logs' | 'setup'>('setup');
@@ -68,8 +69,14 @@ export default function App() {
   const [pythonCode, setPythonCode] = useState<string>('# Python output will appear here');
   const [sessionId] = useState(() => Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15));
   const [copied, setCopied] = useState(false);
+  const [providerConfig, setProviderConfig] = useState<ProviderConfig>({
+    provider: 'gemini',
+    model: 'gemini-3.1-pro-preview',
+    apiKey: '',
+    baseUrl: ''
+  });
+  const [lmStudioInfo, setLmStudioInfo] = useState<{ installations: string[]; models: string[]; endpoint: string } | null>(null);
   
-  const chatEndRef = useRef<HTMLDivElement>(null);
 
   const agentScript = `import bpy
 import json
@@ -275,12 +282,8 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
   }, [sessionId, activeTab]);
 
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
-
-  useEffect(() => {
-    persistProviderSettings({ provider, model, baseUrl });
-  }, [provider, model, baseUrl]);
+    persistProviderSettings({ provider: providerConfig.provider, model: providerConfig.model, baseUrl: providerConfig.baseUrl || '' });
+  }, [providerConfig.provider, providerConfig.model, providerConfig.baseUrl]);
 
   useEffect(() => {
     if (!toast) return;
@@ -300,18 +303,24 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
     setToast({ type, message });
   };
 
-  const handleProviderChange = (nextProvider: ProviderId) => {
+  const handleProviderChange = (nextProvider: ProviderConfig['provider']) => {
     const defaults = PROVIDER_DEFINITIONS[nextProvider];
-    setProvider(nextProvider);
-    setModel(defaults.defaultModel);
-    setBaseUrl(defaults.defaultBaseUrl);
+    setProviderConfig(prev => ({
+      ...prev,
+      provider: nextProvider,
+      model: defaults.defaultModel,
+      baseUrl: defaults.defaultBaseUrl
+    }));
     setProviderErrors({});
     setProviderStatus(null);
     setProviderStatusType(null);
   };
 
   const handleTestConnection = async () => {
-    const nextErrors = validateProviderSettings({ provider, model, baseUrl }, apiKey);
+    const nextErrors = validateProviderSettings(
+      { provider: providerConfig.provider, model: providerConfig.model, baseUrl: providerConfig.baseUrl || '' },
+      providerConfig.apiKey || ''
+    );
     setProviderErrors(nextErrors);
     if (Object.keys(nextErrors).length > 0) {
       pushStatus('error', 'Fix validation errors before testing the connection.');
@@ -323,7 +332,12 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
       const response = await fetch('/api/providers/test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider, model, baseUrl, apiKey })
+        body: JSON.stringify({
+          provider: providerConfig.provider,
+          model: providerConfig.model,
+          baseUrl: providerConfig.baseUrl,
+          apiKey: providerConfig.apiKey
+        })
       });
       const data = await response.json();
       if (!response.ok || !data.ok) {
@@ -339,8 +353,8 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
     }
   };
 
-  const executeToolInBlender = async (tool: string, args: any) => {
-    return new Promise(async (resolve) => {
+  const executeToolInBlender = async (tool: string, args: any): Promise<any> => {
+    return new Promise<any>(async (resolve) => {
       try {
         const { db } = await import('./firebase');
         const { doc, setDoc, onSnapshot } = await import('firebase/firestore');
@@ -380,12 +394,11 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
     });
   };
 
-  const handleSend = async () => {
-    if (!input.trim() || isTyping) return;
+  const handleSend = async (inputValue: string) => {
+    if (!inputValue.trim() || isTyping) return;
 
-    const userMsg: Message = { role: 'user', content: input };
+    const userMsg: Message = { role: 'user', content: inputValue };
     setMessages(prev => [...prev, userMsg]);
-    setInput('');
     setIsTyping(true);
 
     try {
@@ -396,15 +409,13 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
           return { role: m.role, parts: [{ text: m.content }] };
         });
         
-      currentHistory.push({ role: 'user', parts: [{ text: input }] });
+      currentHistory.push({ role: 'user', parts: [{ text: inputValue }] });
 
-      let response = await ai.models.generateContent({
-        model: "gemini-2.5-pro",
+      let response = await generateLlmContent({
+        config: providerConfig,
         contents: currentHistory,
-        config: {
-          systemInstruction: SYSTEM_INSTRUCTION,
-          tools: [{ functionDeclarations: BLENDER_TOOLS }]
-        }
+        systemInstruction: SYSTEM_INSTRUCTION,
+        tools: BLENDER_TOOLS
       });
       
       while (response.functionCalls && response.functionCalls.length > 0) {
@@ -417,6 +428,12 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
         });
         
         for (const call of response.functionCalls) {
+          setMessages(prev => [...prev, {
+            role: 'function',
+            parts: [{ functionCall: call }],
+            content: `Running tool: ${call.name}`
+          }]);
+
           if (call.name === 'execute_python') {
             setPythonCode((call.args as any).code);
             setActiveTab('code');
@@ -431,6 +448,17 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
           if (call.name === 'execute_python' && result?.output) {
              setLogs(prev => [...prev, result.output].slice(-50));
           }
+
+          setMessages(prev => [...prev, {
+            role: 'function',
+            parts: [{
+              functionResponse: {
+                name: call.name,
+                response: result
+              }
+            }],
+            content: `Tool result (${call.name}): ${JSON.stringify(sanitizeToolPayload(result), null, 2)}`
+          }]);
           
           functionResponses.push({
             functionResponse: {
@@ -447,13 +475,11 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
         });
         
         // Call Gemini again with the results
-        response = await ai.models.generateContent({
-          model: "gemini-2.5-pro",
+        response = await generateLlmContent({
+          config: providerConfig,
           contents: currentHistory,
-          config: {
-            systemInstruction: SYSTEM_INSTRUCTION,
-            tools: [{ functionDeclarations: BLENDER_TOOLS }]
-          }
+          systemInstruction: SYSTEM_INSTRUCTION,
+          tools: BLENDER_TOOLS
         });
       }
 
@@ -462,9 +488,37 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
       }
     } catch (error) {
       console.error(error);
-      setMessages(prev => [...prev, { role: 'model', content: 'Error connecting to Gemini or Blender.' }]);
+      setMessages(prev => [...prev, { role: 'model', content: `Error connecting to ${providerConfig.provider} or Blender.` }]);
     } finally {
       setIsTyping(false);
+    }
+  };
+
+  const applyPreset = (presetLabel: string) => {
+    const preset = MODEL_PRESETS.find(p => p.label === presetLabel);
+    if (!preset) return;
+    setProviderConfig(prev => ({
+      ...prev,
+      provider: preset.provider,
+      model: preset.model,
+      baseUrl: preset.baseUrl ?? prev.baseUrl
+    }));
+  };
+
+  const refreshLmStudio = async () => {
+    try {
+      const info = await discoverLmStudio();
+      setLmStudioInfo(info);
+      if (info.models.length > 0) {
+        setProviderConfig(prev => ({
+          ...prev,
+          provider: 'lmstudio',
+          baseUrl: info.endpoint,
+          model: prev.model === 'auto' ? info.models[0] : prev.model
+        }));
+      }
+    } catch (e) {
+      console.error(e);
     }
   };
 
@@ -540,68 +594,7 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
         {/* Workspace */}
         <div className="flex-1 flex overflow-hidden">
           {/* Chat Panel */}
-          <div className="w-[450px] flex flex-col border-r border-[#222] bg-[#0a0a0a]">
-            <div className="flex-1 overflow-y-auto p-6 space-y-6 scrollbar-hide">
-              {messages.map((msg, i) => {
-                if (!msg.content) return null;
-                return (
-                  <div key={i} className={`flex gap-4 ${msg.role === 'user' ? 'justify-end' : ''}`}>
-                    {msg.role === 'model' && (
-                      <div className="w-8 h-8 rounded-full bg-[#3b82f6]/10 flex items-center justify-center flex-shrink-0">
-                        <Sparkles className="w-4 h-4 text-[#3b82f6]" />
-                      </div>
-                    )}
-                    <div className={`max-w-[85%] rounded-2xl p-4 text-sm leading-relaxed ${
-                      msg.role === 'user' 
-                        ? 'bg-[#3b82f6] text-white' 
-                        : 'bg-[#1a1a1a] border border-[#333] text-[#e0e0e0]'
-                    }`}>
-                      <div className="prose prose-invert prose-sm max-w-none">
-                        <Markdown>
-                          {msg.content}
-                        </Markdown>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-              {isTyping && (
-                <div className="flex gap-4">
-                  <div className="w-8 h-8 rounded-full bg-[#3b82f6]/10 flex items-center justify-center">
-                    <Sparkles className="w-4 h-4 text-[#3b82f6] animate-pulse" />
-                  </div>
-                  <div className="bg-[#1a1a1a] border border-[#333] rounded-2xl p-4 flex gap-1">
-                    <div className="w-1.5 h-1.5 bg-[#444] rounded-full animate-bounce" />
-                    <div className="w-1.5 h-1.5 bg-[#444] rounded-full animate-bounce [animation-delay:0.2s]" />
-                    <div className="w-1.5 h-1.5 bg-[#444] rounded-full animate-bounce [animation-delay:0.4s]" />
-                  </div>
-                </div>
-              )}
-              <div ref={chatEndRef} />
-            </div>
-
-            <div className="p-4 border-t border-[#222]">
-              <div className="relative">
-                <textarea
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), handleSend())}
-                  placeholder="Ask Gemini to build in Blender..."
-                  className="w-full bg-[#1a1a1a] border border-[#333] rounded-xl py-3 pl-4 pr-12 text-sm focus:outline-none focus:border-[#3b82f6] transition-colors resize-none min-h-[100px]"
-                />
-                <button 
-                  onClick={handleSend}
-                  disabled={!input.trim() || isTyping}
-                  className="absolute right-3 bottom-3 p-2 bg-[#3b82f6] disabled:bg-[#222] text-white rounded-lg transition-all hover:scale-105 active:scale-95"
-                >
-                  <Send className="w-4 h-4" />
-                </button>
-              </div>
-              <div className="mt-2 text-[10px] text-[#555] text-center">
-                Gemini can control Blender 5.1 via Python. Results may vary based on scene complexity.
-              </div>
-            </div>
-          </div>
+          <ChatSurface messages={messages} isTyping={isTyping} onSend={handleSend} />
 
           {/* Preview Panel */}
           <div className="flex-1 flex flex-col bg-[#050505]">
@@ -710,8 +703,8 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
                           <label className="text-xs space-y-1">
                             <span className="text-[#888]">Provider</span>
                             <select
-                              value={provider}
-                              onChange={(e) => handleProviderChange(e.target.value as ProviderId)}
+                              value={providerConfig.provider}
+                              onChange={(e) => handleProviderChange(e.target.value as ProviderConfig['provider'])}
                               className="w-full bg-[#111] border border-[#333] rounded-md p-2 text-sm focus:outline-none focus:border-[#3b82f6]"
                             >
                               {Object.values(PROVIDER_DEFINITIONS).map((definition) => (
@@ -724,8 +717,8 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
                           <label className="text-xs space-y-1">
                             <span className="text-[#888]">Model</span>
                             <input
-                              value={model}
-                              onChange={(e) => setModel(e.target.value)}
+                              value={providerConfig.model}
+                              onChange={(e) => setProviderConfig(prev => ({ ...prev, model: e.target.value }))}
                               className={`w-full bg-[#111] border rounded-md p-2 text-sm focus:outline-none ${
                                 providerErrors.model ? 'border-red-500' : 'border-[#333] focus:border-[#3b82f6]'
                               }`}
@@ -738,8 +731,8 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
                         <label className="text-xs space-y-1 block">
                           <span className="text-[#888]">Base URL</span>
                           <input
-                            value={baseUrl}
-                            onChange={(e) => setBaseUrl(e.target.value)}
+                            value={providerConfig.baseUrl || ''}
+                            onChange={(e) => setProviderConfig(prev => ({ ...prev, baseUrl: e.target.value }))}
                             className={`w-full bg-[#111] border rounded-md p-2 text-sm focus:outline-none ${
                               providerErrors.baseUrl ? 'border-red-500' : 'border-[#333] focus:border-[#3b82f6]'
                             }`}
@@ -753,12 +746,12 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
                           <div className="relative">
                             <input
                               type={showApiKey ? 'text' : 'password'}
-                              value={apiKey}
-                              onChange={(e) => setApiKey(e.target.value)}
+                              value={providerConfig.apiKey || ''}
+                              onChange={(e) => setProviderConfig(prev => ({ ...prev, apiKey: e.target.value }))}
                               className={`w-full bg-[#111] border rounded-md p-2 pr-10 text-sm focus:outline-none ${
                                 providerErrors.apiKey ? 'border-red-500' : 'border-[#333] focus:border-[#3b82f6]'
                               }`}
-                              placeholder={provider === 'lmstudio' ? 'Optional for local servers' : 'Paste API key'}
+                              placeholder={providerConfig.provider === 'lmstudio' ? 'Optional for local servers' : 'Paste API key'}
                             />
                             <button
                               type="button"
@@ -773,7 +766,7 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
                         </label>
 
                         <div className="text-xs text-[#888] border border-[#222] rounded-md p-3 bg-[#0c0c0c]">
-                          {PROVIDER_DEFINITIONS[provider].helperText}
+                          {PROVIDER_DEFINITIONS[providerConfig.provider].helperText}
                         </div>
 
                         <div className="flex items-center gap-3">
@@ -801,6 +794,64 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
                           <h2 className="text-xl font-semibold">Connect Blender 5.1</h2>
                           <p className="text-[#888] text-sm">Run this script in Blender to connect to AI Studio.</p>
                         </div>
+                      </div>
+
+                      <div className="bg-[#111] border border-[#222] rounded-xl p-4 space-y-4">
+                        <h3 className="font-medium">Model Provider Setup</h3>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                          <select
+                            value={providerConfig.provider}
+                            onChange={(e) => setProviderConfig(prev => ({ ...prev, provider: e.target.value as ProviderConfig['provider'] }))}
+                            className="bg-[#1a1a1a] border border-[#333] rounded-md px-3 py-2 text-sm"
+                          >
+                            <option value="openai">OpenAI</option>
+                            <option value="anthropic">Anthropic-compatible</option>
+                            <option value="gemini">Gemini</option>
+                            <option value="lmstudio">LM Studio</option>
+                          </select>
+                          <input
+                            value={providerConfig.model}
+                            onChange={(e) => setProviderConfig(prev => ({ ...prev, model: e.target.value }))}
+                            placeholder="Model name"
+                            className="bg-[#1a1a1a] border border-[#333] rounded-md px-3 py-2 text-sm"
+                          />
+                          <input
+                            value={providerConfig.apiKey || ''}
+                            onChange={(e) => setProviderConfig(prev => ({ ...prev, apiKey: e.target.value }))}
+                            placeholder="API key / auth token"
+                            className="bg-[#1a1a1a] border border-[#333] rounded-md px-3 py-2 text-sm md:col-span-2"
+                          />
+                          <input
+                            value={providerConfig.baseUrl || ''}
+                            onChange={(e) => setProviderConfig(prev => ({ ...prev, baseUrl: e.target.value }))}
+                            placeholder="Base URL (optional)"
+                            className="bg-[#1a1a1a] border border-[#333] rounded-md px-3 py-2 text-sm md:col-span-2"
+                          />
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          {MODEL_PRESETS.map(p => (
+                            <button
+                              key={p.label}
+                              onClick={() => applyPreset(p.label)}
+                              className="px-3 py-1 text-xs rounded-md bg-[#1a1a1a] border border-[#333] hover:bg-[#222]"
+                            >
+                              {p.label}
+                            </button>
+                          ))}
+                          <button
+                            onClick={refreshLmStudio}
+                            className="px-3 py-1 text-xs rounded-md bg-[#1a1a1a] border border-[#333] hover:bg-[#222]"
+                          >
+                            Discover LM Studio
+                          </button>
+                        </div>
+                        {lmStudioInfo && (
+                          <div className="text-xs text-[#888] space-y-1">
+                            <div>Endpoint: {lmStudioInfo.endpoint}</div>
+                            <div>Installations: {lmStudioInfo.installations.length ? lmStudioInfo.installations.join(', ') : 'none found'}</div>
+                            <div>Models: {lmStudioInfo.models.length ? lmStudioInfo.models.join(', ') : 'none reported'}</div>
+                          </div>
+                        )}
                       </div>
 
                       <div className="space-y-4">
