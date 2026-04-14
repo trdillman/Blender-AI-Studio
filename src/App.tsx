@@ -18,21 +18,41 @@ import {
   Monitor,
   Download,
   Copy,
-  Check
+  Check,
+  Clock3,
+  ExternalLink
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { ai, BLENDER_TOOLS, SYSTEM_INSTRUCTION } from './services/geminiService';
 import Markdown from 'react-markdown';
 
 interface Message {
+  id: string;
   role: 'user' | 'model' | 'function';
   content?: string;
   parts?: any[];
 }
 
+type ToolStatus = 'queued' | 'running' | 'completed' | 'failed';
+
+interface ToolTimelineEvent {
+  id: string;
+  messageId: string;
+  toolName: string;
+  args: any;
+  argsPreview: string;
+  status: ToolStatus;
+  startTimestamp?: number;
+  endTimestamp?: number;
+  result?: any;
+  error?: string;
+}
+
+const generateId = () => Math.random().toString(36).substring(2, 15);
+
 export default function App() {
   const [messages, setMessages] = useState<Message[]>([
-    { role: 'model', content: 'Welcome to Blender AI Studio. I have direct access to your Blender 5.1 instance via Firebase. How can I help you build today?' }
+    { id: generateId(), role: 'model', content: 'Welcome to Blender AI Studio. I have direct access to your Blender 5.1 instance via Firebase. How can I help you build today?' }
   ]);
   const [input, setInput] = useState('');
   const [isBlenderConnected, setIsBlenderConnected] = useState(false);
@@ -43,6 +63,7 @@ export default function App() {
   const [pythonCode, setPythonCode] = useState<string>('# Python output will appear here');
   const [sessionId] = useState(() => Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15));
   const [copied, setCopied] = useState(false);
+  const [toolTimeline, setToolTimeline] = useState<ToolTimelineEvent[]>([]);
   
   const chatEndRef = useRef<HTMLDivElement>(null);
 
@@ -303,7 +324,7 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
   const handleSend = async () => {
     if (!input.trim() || isTyping) return;
 
-    const userMsg: Message = { role: 'user', content: input };
+    const userMsg: Message = { id: generateId(), role: 'user', content: input };
     setMessages(prev => [...prev, userMsg]);
     setInput('');
     setIsTyping(true);
@@ -329,6 +350,15 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
       
       while (response.functionCalls && response.functionCalls.length > 0) {
         const functionResponses = [];
+        const assistantMessageId = generateId();
+        setMessages(prev => [
+          ...prev,
+          {
+            id: assistantMessageId,
+            role: 'model',
+            content: response.text || `Using ${response.functionCalls.length} Blender tool${response.functionCalls.length > 1 ? 's' : ''}...`
+          }
+        ]);
         
         // Append the model's function calls to history
         currentHistory.push({
@@ -337,12 +367,43 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
         });
         
         for (const call of response.functionCalls) {
+          const timelineEventId = generateId();
+          const argsPreview = JSON.stringify(call.args).slice(0, 140);
+          const startTimestamp = Date.now();
+          
+          setToolTimeline(prev => [
+            ...prev,
+            {
+              id: timelineEventId,
+              messageId: assistantMessageId,
+              toolName: call.name,
+              args: call.args,
+              argsPreview: argsPreview.length >= 140 ? `${argsPreview}...` : argsPreview,
+              status: 'queued'
+            }
+          ]);
+          setToolTimeline(prev => prev.map(event => event.id === timelineEventId ? {
+            ...event,
+            status: 'running',
+            startTimestamp
+          } : event));
+
           if (call.name === 'execute_python') {
             setPythonCode((call.args as any).code);
             setActiveTab('code');
           }
           
           const result = await executeToolInBlender(call.name, call.args);
+          const isError = Boolean(result?.error);
+          const endTimestamp = Date.now();
+
+          setToolTimeline(prev => prev.map(event => event.id === timelineEventId ? {
+            ...event,
+            status: isError ? 'failed' : 'completed',
+            endTimestamp,
+            result,
+            error: isError ? result.error : undefined
+          } : event));
           
           if (call.name === 'take_screenshot' && result?.image) {
              setLastScreenshot(result.image);
@@ -378,11 +439,11 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
       }
 
       if (response.text) {
-        setMessages(prev => [...prev, { role: 'model', content: response.text }]);
+        setMessages(prev => [...prev, { id: generateId(), role: 'model', content: response.text }]);
       }
     } catch (error) {
       console.error(error);
-      setMessages(prev => [...prev, { role: 'model', content: 'Error connecting to Gemini or Blender.' }]);
+      setMessages(prev => [...prev, { id: generateId(), role: 'model', content: 'Error connecting to Gemini or Blender.' }]);
     } finally {
       setIsTyping(false);
     }
@@ -464,8 +525,12 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
             <div className="flex-1 overflow-y-auto p-6 space-y-6 scrollbar-hide">
               {messages.map((msg, i) => {
                 if (!msg.content) return null;
+                const messageToolEvents = msg.role === 'model'
+                  ? toolTimeline.filter(event => event.messageId === msg.id)
+                  : [];
+
                 return (
-                  <div key={i} className={`flex gap-4 ${msg.role === 'user' ? 'justify-end' : ''}`}>
+                  <div key={msg.id || i} className={`flex gap-4 ${msg.role === 'user' ? 'justify-end' : ''}`}>
                     {msg.role === 'model' && (
                       <div className="w-8 h-8 rounded-full bg-[#3b82f6]/10 flex items-center justify-center flex-shrink-0">
                         <Sparkles className="w-4 h-4 text-[#3b82f6]" />
@@ -482,6 +547,18 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
                         </Markdown>
                       </div>
                     </div>
+                    {msg.role === 'model' && messageToolEvents.length > 0 && (
+                      <div className="mt-3 space-y-2">
+                        {messageToolEvents.map((event) => (
+                          <ToolTimelineCard
+                            key={event.id}
+                            event={event}
+                            onOpenCode={() => setActiveTab('code')}
+                            onOpenLogs={() => setActiveTab('logs')}
+                          />
+                        ))}
+                      </div>
+                    )}
                   </div>
                 );
               })}
@@ -679,6 +756,112 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
             </div>
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+function ToolTimelineCard({
+  event,
+  onOpenCode,
+  onOpenLogs
+}: {
+  event: ToolTimelineEvent;
+  onOpenCode: () => void;
+  onOpenLogs: () => void;
+}) {
+  const duration = event.startTimestamp && event.endTimestamp
+    ? `${event.endTimestamp - event.startTimestamp}ms`
+    : event.status === 'running' && event.startTimestamp
+      ? `${Date.now() - event.startTimestamp}ms`
+      : '—';
+
+  const handleCopy = (value: any) => {
+    navigator.clipboard.writeText(JSON.stringify(value, null, 2));
+  };
+
+  const statusStyles: Record<ToolStatus, string> = {
+    queued: 'bg-[#2a2a2a] text-[#aaa] border-[#3a3a3a]',
+    running: 'bg-blue-500/15 text-blue-300 border-blue-500/30',
+    completed: 'bg-green-500/15 text-green-300 border-green-500/30',
+    failed: 'bg-red-500/15 text-red-300 border-red-500/30'
+  };
+
+  return (
+    <div className="rounded-xl border border-[#2c2c2c] bg-[#101010] p-3 space-y-2">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="font-medium text-[#ddd] text-xs flex items-center gap-2">
+            <Activity className="w-3.5 h-3.5" />
+            {event.toolName}
+          </div>
+          <div className="text-[11px] text-[#777] mt-1 truncate max-w-[260px]">
+            {event.argsPreview}
+          </div>
+        </div>
+        <div className="flex flex-col items-end gap-1">
+          <span className={`text-[10px] px-2 py-0.5 rounded-full border font-medium uppercase tracking-wide ${statusStyles[event.status]}`}>
+            {event.status}
+          </span>
+          <span className="text-[10px] text-[#666] flex items-center gap-1">
+            <Clock3 className="w-3 h-3" />
+            {duration}
+          </span>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-2 text-[10px] text-[#666]">
+        <div>Start: {event.startTimestamp ? new Date(event.startTimestamp).toLocaleTimeString() : '—'}</div>
+        <div>End: {event.endTimestamp ? new Date(event.endTimestamp).toLocaleTimeString() : '—'}</div>
+      </div>
+
+      <details className="rounded-md border border-[#252525]">
+        <summary className="cursor-pointer px-2 py-1 text-xs text-[#aaa] flex items-center justify-between">
+          Args JSON
+          <button
+            type="button"
+            className="text-[10px] text-[#999] hover:text-white"
+            onClick={(e) => {
+              e.preventDefault();
+              handleCopy(event.args);
+            }}
+          >
+            <Copy className="w-3 h-3 inline mr-1" />
+            Copy
+          </button>
+        </summary>
+        <pre className="p-2 text-[11px] overflow-auto border-t border-[#252525] text-[#9ec0ff]">{JSON.stringify(event.args, null, 2)}</pre>
+      </details>
+
+      <details className="rounded-md border border-[#252525]">
+        <summary className="cursor-pointer px-2 py-1 text-xs text-[#aaa] flex items-center justify-between">
+          Result JSON
+          <button
+            type="button"
+            className="text-[10px] text-[#999] hover:text-white"
+            onClick={(e) => {
+              e.preventDefault();
+              handleCopy(event.result ?? { error: event.error ?? null });
+            }}
+          >
+            <Copy className="w-3 h-3 inline mr-1" />
+            Copy
+          </button>
+        </summary>
+        <pre className="p-2 text-[11px] overflow-auto border-t border-[#252525] text-[#b8e1c0]">{JSON.stringify(event.result ?? { error: event.error ?? null }, null, 2)}</pre>
+      </details>
+
+      <div className="flex flex-wrap gap-2 pt-1">
+        {event.toolName === 'execute_python' && (
+          <>
+            <button onClick={onOpenCode} className="text-[10px] px-2 py-1 rounded bg-[#1b1b1b] border border-[#2f2f2f] hover:bg-[#252525] inline-flex items-center gap-1">
+              Open Script Tab <ExternalLink className="w-3 h-3" />
+            </button>
+            <button onClick={onOpenLogs} className="text-[10px] px-2 py-1 rounded bg-[#1b1b1b] border border-[#2f2f2f] hover:bg-[#252525] inline-flex items-center gap-1">
+              Open Logs Tab <ExternalLink className="w-3 h-3" />
+            </button>
+          </>
+        )}
       </div>
     </div>
   );
