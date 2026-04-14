@@ -3,13 +3,10 @@ import {
   Send, 
   Box, 
   Code, 
-  Image as ImageIcon, 
   Terminal, 
   Settings, 
-  Layers, 
   Play, 
   Cpu,
-  Activity,
   ChevronRight,
   Plus,
   Search,
@@ -18,16 +15,24 @@ import {
   Monitor,
   Download,
   Copy,
-  Check
+  Check,
+  Star,
+  RotateCcw
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { ai, BLENDER_TOOLS, SYSTEM_INSTRUCTION } from './services/geminiService';
 import Markdown from 'react-markdown';
+import { PROMPT_TEMPLATES } from './data/promptTemplates';
 
 interface Message {
   role: 'user' | 'model' | 'function';
   content?: string;
   parts?: any[];
+}
+
+interface ToolCall {
+  name: string;
+  args: any;
 }
 
 export default function App() {
@@ -43,8 +48,20 @@ export default function App() {
   const [pythonCode, setPythonCode] = useState<string>('# Python output will appear here');
   const [sessionId] = useState(() => Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15));
   const [copied, setCopied] = useState(false);
+  const [favorites, setFavorites] = useState<string[]>([]);
+  const [showQuickSwitch, setShowQuickSwitch] = useState(false);
+  const [selectedProvider, setSelectedProvider] = useState('Google');
+  const [selectedModel, setSelectedModel] = useState('gemini-2.5-pro');
+  const [lastToolSequence, setLastToolSequence] = useState<ToolCall[]>([]);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsState, setSettingsState] = useState({
+    autoScroll: true,
+    compactMode: false,
+    markdownDensity: 'comfortable' as 'comfortable' | 'compact'
+  });
   
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
 
   const agentScript = `import bpy
 import json
@@ -250,8 +267,109 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
   }, [sessionId, activeTab]);
 
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+    if (settingsState.autoScroll) {
+      chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [messages, settingsState.autoScroll]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const isCmd = event.metaKey || event.ctrlKey;
+      if (!isCmd) return;
+
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        const sendButton = document.getElementById('composer-send-btn') as HTMLButtonElement | null;
+        sendButton?.click();
+      }
+
+      if (event.key.toLowerCase() === 'k') {
+        event.preventDefault();
+        setShowQuickSwitch(prev => !prev);
+      }
+
+      if (event.key === '/') {
+        event.preventDefault();
+        inputRef.current?.focus();
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
+
+  const appendModelMessage = (content: string) => {
+    setMessages(prev => [...prev, { role: 'model', content }]);
+  };
+
+  const runToolSequence = async (sequence: ToolCall[]) => {
+    const results: Array<{ name: string; result: any }> = [];
+    for (const call of sequence) {
+      if (call.name === 'execute_python') {
+        setPythonCode((call.args as any).code ?? '');
+        setActiveTab('code');
+      }
+      const result: any = await executeToolInBlender(call.name, call.args);
+      if (call.name === 'take_screenshot' && result?.image) {
+        setLastScreenshot(result.image);
+        setActiveTab('viewport');
+      }
+      if (call.name === 'execute_python' && result?.output) {
+        setLogs(prev => [...prev, result.output].slice(-50));
+      }
+      results.push({ name: call.name, result });
+    }
+    return results;
+  };
+
+  const runSlashCommand = async (rawInput: string): Promise<boolean> => {
+    if (!rawInput.startsWith('/')) return false;
+    const [command, ...rest] = rawInput.trim().split(' ');
+    const payload = rest.join(' ').trim();
+
+    if (command === '/screenshot') {
+      const mode = ['WINDOW', 'CAMERA', 'VIEWPORT'].includes(payload.toUpperCase()) ? payload.toUpperCase() : 'VIEWPORT';
+      const sequence = [{ name: 'take_screenshot', args: { mode } }];
+      setLastToolSequence(sequence);
+      const [first] = await runToolSequence(sequence);
+      appendModelMessage(first.result?.error ? `Screenshot failed: ${first.result.error}` : `Captured ${mode.toLowerCase()} screenshot.`);
+      return true;
+    }
+
+    if (command === '/scene') {
+      const sequence = [{ name: 'get_scene_data', args: { query: payload || 'summary' } }];
+      setLastToolSequence(sequence);
+      const [first] = await runToolSequence(sequence);
+      appendModelMessage(`Scene data:\n\`\`\`json\n${JSON.stringify(first.result, null, 2)}\n\`\`\``);
+      return true;
+    }
+
+    if (command === '/python') {
+      if (!payload) {
+        appendModelMessage('Usage: `/python <code>`');
+        return true;
+      }
+      const sequence = [{ name: 'execute_python', args: { code: payload } }];
+      setLastToolSequence(sequence);
+      const [first] = await runToolSequence(sequence);
+      appendModelMessage(`Python result:\n\`\`\`json\n${JSON.stringify(first.result, null, 2)}\n\`\`\``);
+      return true;
+    }
+
+    return false;
+  };
+
+  const copyLastCodeBlock = async () => {
+    const modelText = [...messages].reverse().find(m => m.role === 'model' && m.content)?.content ?? '';
+    const matches = [...modelText.matchAll(/```(?:\w+)?\n([\s\S]*?)```/g)];
+    const lastBlock = matches.length > 0 ? matches[matches.length - 1][1].trim() : '';
+    if (!lastBlock) {
+      appendModelMessage('No code block found in the last assistant response.');
+      return;
+    }
+    await navigator.clipboard.writeText(lastBlock);
+    appendModelMessage('Copied latest code block to clipboard.');
+  };
 
   const handleCopyScript = () => {
     navigator.clipboard.writeText(agentScript);
@@ -303,12 +421,18 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
   const handleSend = async () => {
     if (!input.trim() || isTyping) return;
 
-    const userMsg: Message = { role: 'user', content: input };
+    const cleanInput = input.trim();
+    const userMsg: Message = { role: 'user', content: cleanInput };
     setMessages(prev => [...prev, userMsg]);
     setInput('');
     setIsTyping(true);
 
     try {
+      const commandHandled = await runSlashCommand(cleanInput);
+      if (commandHandled) {
+        return;
+      }
+
       let currentHistory: any[] = messages
         .filter(m => m.content || m.parts)
         .map(m => {
@@ -316,10 +440,10 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
           return { role: m.role, parts: [{ text: m.content }] };
         });
         
-      currentHistory.push({ role: 'user', parts: [{ text: input }] });
+      currentHistory.push({ role: 'user', parts: [{ text: cleanInput }] });
 
       let response = await ai.models.generateContent({
-        model: "gemini-2.5-pro",
+        model: selectedModel,
         contents: currentHistory,
         config: {
           systemInstruction: SYSTEM_INSTRUCTION,
@@ -329,6 +453,8 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
       
       while (response.functionCalls && response.functionCalls.length > 0) {
         const functionResponses = [];
+        const sequence = response.functionCalls.map(call => ({ name: call.name, args: call.args }));
+        setLastToolSequence(sequence);
         
         // Append the model's function calls to history
         currentHistory.push({
@@ -342,7 +468,7 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
             setActiveTab('code');
           }
           
-          const result = await executeToolInBlender(call.name, call.args);
+          const result: any = await executeToolInBlender(call.name, call.args);
           
           if (call.name === 'take_screenshot' && result?.image) {
              setLastScreenshot(result.image);
@@ -368,7 +494,7 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
         
         // Call Gemini again with the results
         response = await ai.models.generateContent({
-          model: "gemini-2.5-pro",
+          model: selectedModel,
           contents: currentHistory,
           config: {
             systemInstruction: SYSTEM_INSTRUCTION,
@@ -388,8 +514,29 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
     }
   };
 
+  const rerunLastToolSequence = async () => {
+    if (lastToolSequence.length === 0 || isTyping) return;
+    setIsTyping(true);
+    setMessages(prev => [...prev, { role: 'user', content: 'Rerun last tool sequence.' }]);
+    try {
+      const results = await runToolSequence(lastToolSequence);
+      appendModelMessage(`Reran ${lastToolSequence.length} tool call(s):\n\`\`\`json\n${JSON.stringify(results, null, 2)}\n\`\`\``);
+    } finally {
+      setIsTyping(false);
+    }
+  };
+
+  const toggleFavorite = (templateId: string) => {
+    setFavorites(prev => (prev.includes(templateId) ? prev.filter(id => id !== templateId) : [...prev, templateId]));
+  };
+
+  const insertTemplate = (templatePrompt: string) => {
+    setInput(prev => (prev ? `${prev}\n${templatePrompt}` : templatePrompt));
+    inputRef.current?.focus();
+  };
+
   return (
-    <div className="flex h-screen bg-[#0a0a0a] text-[#e0e0e0] font-sans overflow-hidden">
+    <div className={`flex h-screen bg-[#0a0a0a] text-[#e0e0e0] font-sans overflow-hidden ${settingsState.compactMode ? 'text-[13px]' : ''}`}>
       {/* Sidebar */}
       <div className="w-64 border-r border-[#222] flex flex-col bg-[#0f0f0f]">
         <div className="p-4 flex items-center gap-2 border-b border-[#222]">
@@ -436,7 +583,7 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
       </div>
 
       {/* Main Content */}
-      <div className="flex-1 flex flex-col min-w-0">
+      <div className="flex-1 flex flex-col min-w-0 relative">
         {/* Header */}
         <header className="h-14 border-b border-[#222] flex items-center justify-between px-6 bg-[#0f0f0f]">
           <div className="flex items-center gap-4">
@@ -449,6 +596,20 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
           <div className="flex items-center gap-3">
             <button className="p-2 hover:bg-[#222] rounded-md transition-colors">
               <Search className="w-4 h-4" />
+            </button>
+            <button
+              onClick={() => setShowQuickSwitch(true)}
+              className="px-3 py-1.5 text-xs rounded-md border border-[#333] hover:bg-[#1a1a1a] transition-colors"
+              title="Quick switch model/provider (Cmd/Ctrl+K)"
+            >
+              {selectedProvider} · {selectedModel}
+            </button>
+            <button
+              onClick={() => setSettingsOpen(prev => !prev)}
+              className="p-2 hover:bg-[#222] rounded-md transition-colors"
+              title="Interface settings"
+            >
+              <Settings className="w-4 h-4" />
             </button>
             <button className="bg-[#3b82f6] hover:bg-[#2563eb] text-white px-4 py-1.5 rounded-md text-sm font-medium transition-colors flex items-center gap-2">
               <Play className="w-4 h-4" />
@@ -471,12 +632,12 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
                         <Sparkles className="w-4 h-4 text-[#3b82f6]" />
                       </div>
                     )}
-                    <div className={`max-w-[85%] rounded-2xl p-4 text-sm leading-relaxed ${
+                    <div className={`max-w-[85%] rounded-2xl ${settingsState.compactMode ? 'p-3 text-xs' : 'p-4 text-sm'} leading-relaxed ${
                       msg.role === 'user' 
                         ? 'bg-[#3b82f6] text-white' 
                         : 'bg-[#1a1a1a] border border-[#333] text-[#e0e0e0]'
                     }`}>
-                      <div className="prose prose-invert prose-sm max-w-none">
+                      <div className={`prose prose-invert ${settingsState.markdownDensity === 'compact' ? 'prose-sm' : 'prose-base'} max-w-none`}>
                         <Markdown>
                           {msg.content}
                         </Markdown>
@@ -501,15 +662,47 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
             </div>
 
             <div className="p-4 border-t border-[#222]">
+              <div className="mb-3 flex flex-wrap gap-2">
+                {PROMPT_TEMPLATES.map(template => (
+                  <div key={template.id} className="flex items-center rounded-md border border-[#333] bg-[#111]">
+                    <button
+                      onClick={() => insertTemplate(template.prompt)}
+                      className="px-2 py-1 text-[11px] hover:bg-[#1a1a1a] rounded-l-md"
+                      title={template.description}
+                    >
+                      {template.title}
+                    </button>
+                    <button
+                      onClick={() => toggleFavorite(template.id)}
+                      className="px-1.5 py-1 border-l border-[#333] hover:bg-[#1a1a1a] rounded-r-md"
+                      title="Favorite snippet"
+                    >
+                      <Star className={`w-3 h-3 ${favorites.includes(template.id) ? 'fill-yellow-400 text-yellow-400' : 'text-[#666]'}`} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <div className="mb-3 flex items-center gap-2 text-[11px] text-[#777]">
+                <button onClick={copyLastCodeBlock} className="px-2 py-1 border border-[#333] rounded-md hover:bg-[#1a1a1a]">
+                  Copy last code block
+                </button>
+                <button onClick={rerunLastToolSequence} className="px-2 py-1 border border-[#333] rounded-md hover:bg-[#1a1a1a] flex items-center gap-1">
+                  <RotateCcw className="w-3 h-3" />
+                  Rerun tools
+                </button>
+                <span className="ml-auto">Slash: /screenshot /scene /python</span>
+              </div>
               <div className="relative">
                 <textarea
+                  ref={inputRef}
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), handleSend())}
-                  placeholder="Ask Gemini to build in Blender..."
+                  placeholder="Ask Gemini to build in Blender... (/screenshot, /scene, /python)"
                   className="w-full bg-[#1a1a1a] border border-[#333] rounded-xl py-3 pl-4 pr-12 text-sm focus:outline-none focus:border-[#3b82f6] transition-colors resize-none min-h-[100px]"
                 />
                 <button 
+                  id="composer-send-btn"
                   onClick={handleSend}
                   disabled={!input.trim() || isTyping}
                   className="absolute right-3 bottom-3 p-2 bg-[#3b82f6] disabled:bg-[#222] text-white rounded-lg transition-all hover:scale-105 active:scale-95"
@@ -679,7 +872,93 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
             </div>
           </div>
         </div>
+
+        {settingsOpen && (
+          <div className="absolute top-16 right-6 w-72 bg-[#111] border border-[#333] rounded-xl p-4 space-y-4 shadow-2xl z-20">
+            <h3 className="text-sm font-semibold">Interface Settings</h3>
+            <label className="flex items-center justify-between text-xs">
+              Auto-scroll chat
+              <input
+                type="checkbox"
+                checked={settingsState.autoScroll}
+                onChange={(e) => setSettingsState(prev => ({ ...prev, autoScroll: e.target.checked }))}
+              />
+            </label>
+            <label className="flex items-center justify-between text-xs">
+              Compact mode
+              <input
+                type="checkbox"
+                checked={settingsState.compactMode}
+                onChange={(e) => setSettingsState(prev => ({ ...prev, compactMode: e.target.checked }))}
+              />
+            </label>
+            <label className="flex items-center justify-between text-xs">
+              Markdown density
+              <select
+                value={settingsState.markdownDensity}
+                onChange={(e) => setSettingsState(prev => ({ ...prev, markdownDensity: e.target.value as 'comfortable' | 'compact' }))}
+                className="bg-[#1a1a1a] border border-[#333] rounded px-2 py-1"
+              >
+                <option value="comfortable">Comfortable</option>
+                <option value="compact">Compact</option>
+              </select>
+            </label>
+          </div>
+        )}
       </div>
+
+      <AnimatePresence>
+        {showQuickSwitch && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="absolute inset-0 bg-black/50 flex items-start justify-center pt-24 z-30"
+            onClick={() => setShowQuickSwitch(false)}
+          >
+            <motion.div
+              initial={{ y: -12, opacity: 0 }}
+              animate={{ y: 0, opacity: 1 }}
+              exit={{ y: -12, opacity: 0 }}
+              className="w-[420px] bg-[#111] border border-[#333] rounded-xl p-4"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h3 className="text-sm font-semibold mb-3">Quick Model/Provider Switch</h3>
+              <div className="space-y-3 text-xs">
+                <div>
+                  <div className="text-[#888] mb-1">Provider</div>
+                  <div className="flex gap-2">
+                    {['Google', 'OpenRouter'].map(provider => (
+                      <button
+                        key={provider}
+                        onClick={() => setSelectedProvider(provider)}
+                        className={`px-2 py-1 rounded border ${selectedProvider === provider ? 'border-[#3b82f6] text-[#3b82f6]' : 'border-[#333]'}`}
+                      >
+                        {provider}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[#888] mb-1">Model</div>
+                  <div className="flex flex-wrap gap-2">
+                    {['gemini-2.5-pro', 'gemini-2.5-flash'].map(model => (
+                      <button
+                        key={model}
+                        onClick={() => setSelectedModel(model)}
+                        className={`px-2 py-1 rounded border ${selectedModel === model ? 'border-[#3b82f6] text-[#3b82f6]' : 'border-[#333]'}`}
+                      >
+                        {model}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="text-[#666]">Shortcut: Cmd/Ctrl+K</div>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
