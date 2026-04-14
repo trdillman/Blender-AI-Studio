@@ -29,3 +29,15 @@ This repo now includes a built-in screenshot tool so future Codex sessions can c
    `npm run dev`
 3. Capture a screenshot:
    `npm run screenshot -- --url http://127.0.0.1:3000 --out artifacts/setup-ui.png`
+
+<!-- codex-managed:start -->
+# Codex Workflow
+
+## Codex Workflow
+
+- GitHub is the source of truth for Codex App and Codex Cloud work.
+- Local Blender GUI work stays local.
+- Cloud work stays headless-safe by default.
+- `REMOTE_MCP_GATEWAY_URL` is optional and can point at the already-exposed MCP endpoint for local helper tools.
+
+<!-- codex-managed:end -->
