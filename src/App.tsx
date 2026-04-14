@@ -62,7 +62,9 @@ interface Toast { type: 'success' | 'error'; message: string; }
 
 // Helpers
 function createId(): string {
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
+  const arr = new Uint32Array(2);
+  crypto.getRandomValues(arr);
+  return `${Date.now().toString(36)}-${arr[0].toString(36)}${arr[1].toString(36)}`;
 }
 function createWelcomeMessage(): Message {
   return {
@@ -990,13 +992,13 @@ interface ToolTimelineCardProps {
 }
 function ToolTimelineCard({ event }: ToolTimelineCardProps) {
   const durationMs = event.endTimestamp ? event.endTimestamp - event.startTimestamp : null;
-  const statusColour = event.status === 'completed' ? 'text-green-400' : event.status === 'failed' ? 'text-red-400' : 'text-yellow-400';
+  const statusColor = event.status === 'completed' ? 'text-green-400' : event.status === 'failed' ? 'text-red-400' : 'text-yellow-400';
   const statusLabel = event.status === 'running' ? 'Running...' : event.status === 'completed' ? 'Done' : 'Failed';
   return (
     <div className="rounded-lg border border-[#333] bg-[#111] p-2 text-xs space-y-1">
       <div className="flex items-center justify-between gap-2">
         <span className="font-mono text-[#7dd3fc]">{event.toolName}</span>
-        <span className={`${statusColour} font-medium`}>{statusLabel}{durationMs !== null ? ` \u00b7 ${durationMs}ms` : ''}</span>
+        <span className={`${statusColor} font-medium`}>{statusLabel}{durationMs !== null ? ` \u00b7 ${durationMs}ms` : ''}</span>
       </div>
       <div className="text-[#666] truncate">{event.argsPreview}</div>
       {event.status === 'failed' && event.error && <div className="text-red-400 truncate">{event.error}</div>}

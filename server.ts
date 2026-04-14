@@ -129,6 +129,46 @@ async function startServer() {
     res.flushHeaders();
   };
 
+  /**
+   * Validate that a user-supplied base URL is safe to proxy to.
+   * Blocks private and link-local address ranges to prevent SSRF.
+   * Localhost is allowed only for LM Studio provider.
+   */
+  function validateBaseUrl(rawUrl: string, provider: string): string | null {
+    let parsed: URL;
+    try {
+      parsed = new URL(rawUrl);
+    } catch {
+      return "Invalid URL format.";
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return "Only http and https protocols are allowed.";
+    }
+    const hostname = parsed.hostname.toLowerCase();
+    // Allow localhost / loopback only for lmstudio (local inference server)
+    const isLoopback = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+    if (isLoopback && provider !== "lmstudio") {
+      return "Loopback addresses are only allowed for the LM Studio provider.";
+    }
+    // Block RFC-1918 private ranges and link-local (but allow loopback for lmstudio above)
+    const privatePatterns = [
+      /^10\./,
+      /^172\.(1[6-9]|2\d|3[01])\./,
+      /^192\.168\./,
+      /^169\.254\./,
+      /^fc00:/i,
+      /^fe80:/i,
+    ];
+    if (!isLoopback) {
+      for (const pattern of privatePatterns) {
+        if (pattern.test(hostname)) {
+          return "Private network addresses are not allowed as a base URL.";
+        }
+      }
+    }
+    return null; // valid
+  }
+
   app.post("/api/llm/chat", async (req, res) => {
     try {
       const { config, contents, systemInstruction, tools } = req.body || {};
@@ -140,6 +180,12 @@ async function startServer() {
 
       if (!provider || !model) {
         return res.status(400).json({ error: "Missing provider or model" });
+      }
+
+      // Validate user-supplied baseUrl to prevent SSRF
+      if (baseUrl) {
+        const urlError = validateBaseUrl(baseUrl, provider);
+        if (urlError) return res.status(400).json({ error: urlError });
       }
 
       if (provider === "gemini") {
@@ -385,6 +431,12 @@ async function startServer() {
       const { provider, model, apiKey, baseUrl } = req.body || {};
       if (!provider || !model) {
         return res.status(400).json({ ok: false, error: "Missing provider or model" });
+      }
+
+      // Validate user-supplied baseUrl to prevent SSRF
+      if (baseUrl) {
+        const urlError = validateBaseUrl(baseUrl, provider);
+        if (urlError) return res.status(400).json({ ok: false, error: urlError });
       }
 
       if (provider === "gemini") {
