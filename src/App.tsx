@@ -19,7 +19,14 @@ import {
   Check
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { ai, BLENDER_TOOLS, SYSTEM_INSTRUCTION } from './services/geminiService';
+import {
+  BLENDER_TOOLS,
+  SYSTEM_INSTRUCTION,
+  MODEL_PRESETS,
+  ProviderConfig,
+  generateLlmContent,
+  discoverLmStudio
+} from './services/llmService';
 import { ChatSurface } from './components/chat/ChatSurface';
 import { sanitizeToolPayload } from './components/chat/adapters';
 
@@ -41,6 +48,13 @@ export default function App() {
   const [pythonCode, setPythonCode] = useState<string>('# Python output will appear here');
   const [sessionId] = useState(() => Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15));
   const [copied, setCopied] = useState(false);
+  const [providerConfig, setProviderConfig] = useState<ProviderConfig>({
+    provider: 'gemini',
+    model: 'gemini-3.1-pro-preview',
+    apiKey: '',
+    baseUrl: ''
+  });
+  const [lmStudioInfo, setLmStudioInfo] = useState<{ installations: string[]; models: string[]; endpoint: string } | null>(null);
   
 
   const agentScript = `import bpy
@@ -310,13 +324,11 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
         
       currentHistory.push({ role: 'user', parts: [{ text: inputValue }] });
 
-      let response = await ai.models.generateContent({
-        model: "gemini-2.5-pro",
+      let response = await generateLlmContent({
+        config: providerConfig,
         contents: currentHistory,
-        config: {
-          systemInstruction: SYSTEM_INSTRUCTION,
-          tools: [{ functionDeclarations: BLENDER_TOOLS }]
-        }
+        systemInstruction: SYSTEM_INSTRUCTION,
+        tools: BLENDER_TOOLS
       });
       
       while (response.functionCalls && response.functionCalls.length > 0) {
@@ -340,7 +352,7 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
             setActiveTab('code');
           }
           
-          const result = await executeToolInBlender(call.name, call.args);
+          const result: any = await executeToolInBlender(call.name, call.args);
           
           if (call.name === 'take_screenshot' && result?.image) {
              setLastScreenshot(result.image);
@@ -376,13 +388,11 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
         });
         
         // Call Gemini again with the results
-        response = await ai.models.generateContent({
-          model: "gemini-2.5-pro",
+        response = await generateLlmContent({
+          config: providerConfig,
           contents: currentHistory,
-          config: {
-            systemInstruction: SYSTEM_INSTRUCTION,
-            tools: [{ functionDeclarations: BLENDER_TOOLS }]
-          }
+          systemInstruction: SYSTEM_INSTRUCTION,
+          tools: BLENDER_TOOLS
         });
       }
 
@@ -391,9 +401,37 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
       }
     } catch (error) {
       console.error(error);
-      setMessages(prev => [...prev, { role: 'model', content: 'Error connecting to Gemini or Blender.' }]);
+      setMessages(prev => [...prev, { role: 'model', content: `Error connecting to ${providerConfig.provider} or Blender.` }]);
     } finally {
       setIsTyping(false);
+    }
+  };
+
+  const applyPreset = (presetLabel: string) => {
+    const preset = MODEL_PRESETS.find(p => p.label === presetLabel);
+    if (!preset) return;
+    setProviderConfig(prev => ({
+      ...prev,
+      provider: preset.provider,
+      model: preset.model,
+      baseUrl: preset.baseUrl ?? prev.baseUrl
+    }));
+  };
+
+  const refreshLmStudio = async () => {
+    try {
+      const info = await discoverLmStudio();
+      setLmStudioInfo(info);
+      if (info.models.length > 0) {
+        setProviderConfig(prev => ({
+          ...prev,
+          provider: 'lmstudio',
+          baseUrl: info.endpoint,
+          model: prev.model === 'auto' ? info.models[0] : prev.model
+        }));
+      }
+    } catch (e) {
+      console.error(e);
     }
   };
 
@@ -580,6 +618,64 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
                           <h2 className="text-xl font-semibold">Connect Blender 5.1</h2>
                           <p className="text-[#888] text-sm">Run this script in Blender to connect to AI Studio.</p>
                         </div>
+                      </div>
+
+                      <div className="bg-[#111] border border-[#222] rounded-xl p-4 space-y-4">
+                        <h3 className="font-medium">Model Provider Setup</h3>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                          <select
+                            value={providerConfig.provider}
+                            onChange={(e) => setProviderConfig(prev => ({ ...prev, provider: e.target.value as ProviderConfig['provider'] }))}
+                            className="bg-[#1a1a1a] border border-[#333] rounded-md px-3 py-2 text-sm"
+                          >
+                            <option value="openai">OpenAI</option>
+                            <option value="anthropic">Anthropic-compatible</option>
+                            <option value="gemini">Gemini</option>
+                            <option value="lmstudio">LM Studio</option>
+                          </select>
+                          <input
+                            value={providerConfig.model}
+                            onChange={(e) => setProviderConfig(prev => ({ ...prev, model: e.target.value }))}
+                            placeholder="Model name"
+                            className="bg-[#1a1a1a] border border-[#333] rounded-md px-3 py-2 text-sm"
+                          />
+                          <input
+                            value={providerConfig.apiKey || ''}
+                            onChange={(e) => setProviderConfig(prev => ({ ...prev, apiKey: e.target.value }))}
+                            placeholder="API key / auth token"
+                            className="bg-[#1a1a1a] border border-[#333] rounded-md px-3 py-2 text-sm md:col-span-2"
+                          />
+                          <input
+                            value={providerConfig.baseUrl || ''}
+                            onChange={(e) => setProviderConfig(prev => ({ ...prev, baseUrl: e.target.value }))}
+                            placeholder="Base URL (optional)"
+                            className="bg-[#1a1a1a] border border-[#333] rounded-md px-3 py-2 text-sm md:col-span-2"
+                          />
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          {MODEL_PRESETS.map(p => (
+                            <button
+                              key={p.label}
+                              onClick={() => applyPreset(p.label)}
+                              className="px-3 py-1 text-xs rounded-md bg-[#1a1a1a] border border-[#333] hover:bg-[#222]"
+                            >
+                              {p.label}
+                            </button>
+                          ))}
+                          <button
+                            onClick={refreshLmStudio}
+                            className="px-3 py-1 text-xs rounded-md bg-[#1a1a1a] border border-[#333] hover:bg-[#222]"
+                          >
+                            Discover LM Studio
+                          </button>
+                        </div>
+                        {lmStudioInfo && (
+                          <div className="text-xs text-[#888] space-y-1">
+                            <div>Endpoint: {lmStudioInfo.endpoint}</div>
+                            <div>Installations: {lmStudioInfo.installations.length ? lmStudioInfo.installations.join(', ') : 'none found'}</div>
+                            <div>Models: {lmStudioInfo.models.length ? lmStudioInfo.models.join(', ') : 'none reported'}</div>
+                          </div>
+                        )}
                       </div>
 
                       <div className="space-y-4">
