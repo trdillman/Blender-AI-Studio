@@ -116,6 +116,59 @@ async function startServer() {
     res.json({ installations, models, endpoint });
   });
 
+  // SSE helpers
+  const writeSse = (res: express.Response, event: string, data: any) => {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  const setupSse = (res: express.Response) => {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders();
+  };
+
+  /**
+   * Validate that a user-supplied base URL is safe to proxy to.
+   * Blocks private and link-local address ranges to prevent SSRF.
+   * Localhost is allowed only for LM Studio provider.
+   */
+  function validateBaseUrl(rawUrl: string, provider: string): string | null {
+    let parsed: URL;
+    try {
+      parsed = new URL(rawUrl);
+    } catch {
+      return "Invalid URL format.";
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return "Only http and https protocols are allowed.";
+    }
+    const hostname = parsed.hostname.toLowerCase();
+    // Allow localhost / loopback only for lmstudio (local inference server)
+    const isLoopback = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+    if (isLoopback && provider !== "lmstudio") {
+      return "Loopback addresses are only allowed for the LM Studio provider.";
+    }
+    // Block RFC-1918 private ranges and link-local (but allow loopback for lmstudio above)
+    const privatePatterns = [
+      /^10\./,
+      /^172\.(1[6-9]|2\d|3[01])\./,
+      /^192\.168\./,
+      /^169\.254\./,
+      /^fc00:/i,
+      /^fe80:/i,
+    ];
+    if (!isLoopback) {
+      for (const pattern of privatePatterns) {
+        if (pattern.test(hostname)) {
+          return "Private network addresses are not allowed as a base URL.";
+        }
+      }
+    }
+    return null; // valid
+  }
+
   app.post("/api/llm/chat", async (req, res) => {
     try {
       const { config, contents, systemInstruction, tools } = req.body || {};
@@ -123,69 +176,238 @@ async function startServer() {
       const model = config?.model;
       const key = config?.apiKey || "";
       const baseUrl = (config?.baseUrl || "").replace(/\/$/, "");
+      const stream = !!config?.stream;
 
       if (!provider || !model) {
         return res.status(400).json({ error: "Missing provider or model" });
       }
 
+      // Validate user-supplied baseUrl to prevent SSRF
+      if (baseUrl) {
+        const urlError = validateBaseUrl(baseUrl, provider);
+        if (urlError) return res.status(400).json({ error: urlError });
+      }
+
       if (provider === "gemini") {
         const apiKey = key || process.env.GEMINI_API_KEY || "";
         const ai = new GoogleGenAI({ apiKey });
+
+        if (stream) {
+          setupSse(res);
+          try {
+            const geminiStream = await ai.models.generateContentStream({
+              model,
+              contents,
+              config: { systemInstruction, tools: [{ functionDeclarations: tools }] }
+            });
+            let emittedText = "";
+            for await (const chunk of geminiStream) {
+              if (chunk.text) {
+                emittedText += chunk.text;
+                writeSse(res, "text-delta", { textDelta: chunk.text, text: emittedText });
+              }
+              const calls = chunk.functionCalls || [];
+              if (calls.length > 0) {
+                writeSse(res, "tool-call", { toolCalls: calls });
+              }
+            }
+            writeSse(res, "done", {});
+            return res.end();
+          } catch {
+            const response = await ai.models.generateContent({
+              model,
+              contents,
+              config: { systemInstruction, tools: [{ functionDeclarations: tools }] }
+            });
+            writeSse(res, "fallback", { reason: "Gemini streaming unavailable" });
+            writeSse(res, "result", { text: response.text, functionCalls: response.functionCalls });
+            writeSse(res, "done", {});
+            return res.end();
+          }
+        }
+
         const response = await ai.models.generateContent({
           model,
           contents,
-          config: {
-            systemInstruction,
-            tools: [{ functionDeclarations: tools }]
-          }
+          config: { systemInstruction, tools: [{ functionDeclarations: tools }] }
         });
         return res.json({ text: response.text, functionCalls: response.functionCalls });
       }
 
       if (provider === "openai" || provider === "lmstudio") {
         const endpoint = baseUrl || (provider === "lmstudio" ? "http://127.0.0.1:1234/v1" : "https://api.openai.com/v1");
+        const oaiMessages = [
+          { role: "system", content: systemInstruction },
+          ...toOpenAiMessages(contents)
+        ];
+        const oaiTools = (tools || []).map((t: any) => ({
+          type: "function",
+          function: { name: t.name, description: t.description, parameters: t.parameters }
+        }));
+
+        if (stream) {
+          setupSse(res);
+          try {
+            const r = await fetch(`${endpoint}/chat/completions`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", ...(key ? { Authorization: `Bearer ${key}` } : {}) },
+              body: JSON.stringify({ model, stream: true, messages: oaiMessages, tools: oaiTools })
+            });
+            const reader = r.body?.getReader();
+            const decoder = new TextDecoder();
+            let sseBuffer = "";
+            let accText = "";
+            const toolCallMap = new Map<number, any>();
+            while (reader) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              sseBuffer += decoder.decode(value, { stream: true });
+              const sseChunks = sseBuffer.split("\n\n");
+              sseBuffer = sseChunks.pop() || "";
+              for (const sseChunk of sseChunks) {
+                for (const line of sseChunk.split("\n")) {
+                  if (!line.startsWith("data: ")) continue;
+                  const raw = line.slice(6).trim();
+                  if (raw === "[DONE]") continue;
+                  try {
+                    const parsed = JSON.parse(raw);
+                    const delta = parsed.choices?.[0]?.delta;
+                    if (delta?.content) {
+                      accText += delta.content;
+                      writeSse(res, "text-delta", { textDelta: delta.content, text: accText });
+                    }
+                    if (delta?.tool_calls) {
+                      for (const tc of delta.tool_calls) {
+                        const existing = toolCallMap.get(tc.index) || { id: "", name: "", argsRaw: "" };
+                        if (tc.id) existing.id = tc.id;
+                        if (tc.function?.name) existing.name = tc.function.name;
+                        if (tc.function?.arguments) existing.argsRaw = (existing.argsRaw || "") + tc.function.arguments;
+                        toolCallMap.set(tc.index, existing);
+                      }
+                      writeSse(res, "tool-call", {
+                        toolCalls: Array.from(toolCallMap.values()).map((tc) => ({
+                          name: tc.name,
+                          args: safeJson(tc.argsRaw)
+                        }))
+                      });
+                    }
+                  } catch { /* best-effort */ }
+                }
+              }
+            }
+            writeSse(res, "done", {});
+            return res.end();
+          } catch {
+            // Fallback to non-streaming
+            const r = await fetch(`${endpoint}/chat/completions`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", ...(key ? { Authorization: `Bearer ${key}` } : {}) },
+              body: JSON.stringify({ model, messages: oaiMessages, tools: oaiTools })
+            });
+            const data: any = await r.json();
+            const choice = data?.choices?.[0]?.message || {};
+            const functionCalls = Array.isArray(choice.tool_calls)
+              ? choice.tool_calls.filter((c: any) => c?.type === "function").map((c: any) => ({ name: c.function.name, args: safeJson(c.function.arguments) }))
+              : [];
+            writeSse(res, "fallback", { reason: "OpenAI streaming unavailable" });
+            writeSse(res, "result", { text: choice.content || "", functionCalls });
+            writeSse(res, "done", {});
+            return res.end();
+          }
+        }
+
         const r = await fetch(`${endpoint}/chat/completions`, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            ...(key ? { Authorization: `Bearer ${key}` } : {})
-          },
-          body: JSON.stringify({
-            model,
-            messages: [
-              { role: "system", content: systemInstruction },
-              ...toOpenAiMessages(contents)
-            ],
-            tools: (tools || []).map((t: any) => ({ type: "function", function: { name: t.name, description: t.description, parameters: t.parameters } }))
-          })
+          headers: { "Content-Type": "application/json", ...(key ? { Authorization: `Bearer ${key}` } : {}) },
+          body: JSON.stringify({ model, messages: oaiMessages, tools: oaiTools })
         });
         const data: any = await r.json();
         if (!r.ok) return res.status(r.status).json(data);
         const choice = data?.choices?.[0]?.message || {};
         const functionCalls = Array.isArray(choice.tool_calls)
-          ? choice.tool_calls
-              .filter((c: any) => c?.type === "function")
-              .map((c: any) => ({ name: c.function.name, args: safeJson(c.function.arguments) }))
+          ? choice.tool_calls.filter((c: any) => c?.type === "function").map((c: any) => ({ name: c.function.name, args: safeJson(c.function.arguments) }))
           : [];
         return res.json({ text: choice.content || "", functionCalls });
       }
 
       if (provider === "anthropic") {
         const endpoint = baseUrl || "https://api.anthropic.com";
+        const anthropicMessages = toAnthropicMessages(contents);
+        const anthropicTools = (tools || []).map((t: any) => ({ name: t.name, description: t.description, input_schema: t.parameters }));
+
+        if (stream) {
+          setupSse(res);
+          try {
+            const r = await fetch(`${endpoint}/v1/messages`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
+              body: JSON.stringify({ model, system: systemInstruction, max_tokens: 1500, stream: true, messages: anthropicMessages, tools: anthropicTools })
+            });
+            const reader = r.body?.getReader();
+            const decoder = new TextDecoder();
+            let sseBuffer = "";
+            let accText = "";
+            const toolUses = new Map<string | number, any>();
+            while (reader) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              sseBuffer += decoder.decode(value, { stream: true });
+              const sseChunks = sseBuffer.split("\n\n");
+              sseBuffer = sseChunks.pop() || "";
+              for (const sseChunk of sseChunks) {
+                let eventName = "message";
+                let eventData = "";
+                for (const line of sseChunk.split("\n")) {
+                  if (line.startsWith("event:")) eventName = line.slice(6).trim();
+                  if (line.startsWith("data:")) eventData += line.slice(5).trim();
+                }
+                if (!eventData) continue;
+                try {
+                  const payload = JSON.parse(eventData);
+                  if (eventName === "content_block_delta" && payload.delta?.type === "text_delta") {
+                    accText += payload.delta.text || "";
+                    writeSse(res, "text-delta", { textDelta: payload.delta.text, text: accText });
+                  }
+                  if (eventName === "content_block_start" && payload.content_block?.type === "tool_use") {
+                    toolUses.set(payload.index, { id: payload.content_block.id, name: payload.content_block.name, args: {} });
+                    writeSse(res, "tool-call", { toolCalls: Array.from(toolUses.values()) });
+                  }
+                  if (eventName === "content_block_delta" && payload.delta?.type === "input_json_delta") {
+                    const existing = toolUses.get(payload.index);
+                    if (existing) {
+                      existing.argsRaw = (existing.argsRaw || "") + (payload.delta.partial_json || "");
+                      const updated = { ...existing, args: safeJson(existing.argsRaw) };
+                      toolUses.set(payload.index, updated);
+                      writeSse(res, "tool-call", { toolCalls: Array.from(toolUses.values()) });
+                    }
+                  }
+                } catch { /* best-effort */ }
+              }
+            }
+            writeSse(res, "done", {});
+            return res.end();
+          } catch {
+            const r = await fetch(`${endpoint}/v1/messages`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
+              body: JSON.stringify({ model, system: systemInstruction, max_tokens: 1500, messages: anthropicMessages, tools: anthropicTools })
+            });
+            const data: any = await r.json();
+            const text = Array.isArray(data?.content) ? data.content.filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n") : "";
+            const functionCalls = Array.isArray(data?.content)
+              ? data.content.filter((c: any) => c.type === "tool_use").map((c: any) => ({ name: c.name, args: c.input || {} }))
+              : [];
+            writeSse(res, "fallback", { reason: "Anthropic streaming unavailable" });
+            writeSse(res, "result", { text, functionCalls });
+            writeSse(res, "done", {});
+            return res.end();
+          }
+        }
+
         const r = await fetch(`${endpoint}/v1/messages`, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-api-key": key,
-            "anthropic-version": "2023-06-01"
-          },
-          body: JSON.stringify({
-            model,
-            system: systemInstruction,
-            max_tokens: 1500,
-            messages: toAnthropicMessages(contents),
-            tools: (tools || []).map((t: any) => ({ name: t.name, description: t.description, input_schema: t.parameters }))
-          })
+          headers: { "Content-Type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
+          body: JSON.stringify({ model, system: systemInstruction, max_tokens: 1500, messages: anthropicMessages, tools: anthropicTools })
         });
         const data: any = await r.json();
         if (!r.ok) return res.status(r.status).json(data);
@@ -200,6 +422,61 @@ async function startServer() {
     } catch (e: any) {
       console.error("LLM API error", e);
       return res.status(500).json({ error: String(e?.message || e) });
+    }
+  });
+
+  // PR #6 — provider connection test
+  app.post("/api/providers/test", async (req, res) => {
+    try {
+      const { provider, model, apiKey, baseUrl } = req.body || {};
+      if (!provider || !model) {
+        return res.status(400).json({ ok: false, error: "Missing provider or model" });
+      }
+
+      // Validate user-supplied baseUrl to prevent SSRF
+      if (baseUrl) {
+        const urlError = validateBaseUrl(baseUrl, provider);
+        if (urlError) return res.status(400).json({ ok: false, error: urlError });
+      }
+
+      if (provider === "gemini") {
+        const key = apiKey || process.env.GEMINI_API_KEY || "";
+        const ai = new GoogleGenAI({ apiKey: key });
+        await ai.models.generateContent({
+          model,
+          contents: [{ role: "user", parts: [{ text: "ping" }] }],
+          config: { systemInstruction: "Reply with one word." }
+        });
+        return res.json({ ok: true, message: "Gemini connection successful." });
+      }
+
+      if (provider === "openai" || provider === "lmstudio") {
+        const endpoint = (baseUrl || (provider === "lmstudio" ? "http://127.0.0.1:1234/v1" : "https://api.openai.com/v1")).replace(/\/$/, "");
+        const r = await fetch(`${endpoint}/models`, {
+          headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {}
+        });
+        if (!r.ok) return res.status(r.status).json({ ok: false, error: `Provider returned ${r.status}` });
+        return res.json({ ok: true, message: `${provider === "lmstudio" ? "LM Studio" : "OpenAI"} connection successful.` });
+      }
+
+      if (provider === "anthropic") {
+        const endpoint = (baseUrl || "https://api.anthropic.com").replace(/\/$/, "");
+        const r = await fetch(`${endpoint}/v1/messages`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-api-key": apiKey || "", "anthropic-version": "2023-06-01" },
+          body: JSON.stringify({ model, max_tokens: 16, messages: [{ role: "user", content: "ping" }] })
+        });
+        if (!r.ok) {
+          const err: any = await r.json().catch(() => ({}));
+          return res.status(r.status).json({ ok: false, error: err?.error?.message || `Provider returned ${r.status}` });
+        }
+        return res.json({ ok: true, message: "Anthropic connection successful." });
+      }
+
+      return res.status(400).json({ ok: false, error: `Unsupported provider: ${provider}` });
+    } catch (e: any) {
+      console.error("Provider test error", e);
+      return res.status(500).json({ ok: false, error: String(e?.message || e) });
     }
   });
 
