@@ -1,0 +1,45 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: blender_sessions
+    // Document ID: [randomly generated session ID acting as a secret key]
+    // 
+    // Subcollection: commands
+    // Document ID: [randomly generated command ID]
+    // Fields:
+    //   - tool: string (required)
+    //   - args: string (required, JSON)
+    //   - status: string (required, 'pending', 'completed', 'error')
+    //   - result: string (optional, JSON)
+    //   - timestamp: number (required)
+    //
+    // ===============================================================
+
+    // Helper Functions
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function isValidCommand(data) {
+      return data.tool is string &&
+             data.args is string &&
+             data.status in ['pending', 'completed', 'error'] &&
+             data.timestamp is number;
+    }
+
+    match /blender_sessions/{sessionId}/commands/{commandId} {
+      // Allow read/write if the user/script knows the exact sessionId.
+      // Since sessionId is a long random UUID, it acts as a secure token.
+      allow read: if true;
+      allow create: if hasRequiredFields(['tool', 'args', 'status', 'timestamp']) &&
+                       isValidCommand(request.resource.data);
+      allow update: if isValidCommand(request.resource.data);
+      allow delete: if true;
+    }
+  }
+}

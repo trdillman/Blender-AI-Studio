@@ -1,0 +1,41 @@
+{
+  "entities": {
+    "BlenderCommand": {
+      "title": "BlenderCommand",
+      "description": "A command sent to Blender to execute",
+      "type": "object",
+      "properties": {
+        "tool": {
+          "type": "string",
+          "description": "The name of the tool to execute"
+        },
+        "args": {
+          "type": "string",
+          "description": "JSON string of arguments"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "completed", "error"],
+          "description": "Status of the command"
+        },
+        "result": {
+          "type": "string",
+          "description": "JSON string of the result"
+        },
+        "timestamp": {
+          "type": "number",
+          "description": "Timestamp of the command"
+        }
+      },
+      "required": ["tool", "args", "status", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/blender_sessions/{sessionId}/commands/{commandId}": {
+      "schema": {
+        "$ref": "#/entities/BlenderCommand"
+      },
+      "description": "Commands for a specific Blender session"
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "Blender AI Studio",
+  "description": "A Google AI Studio-inspired interface for controlling Blender 5.1 with Gemini, featuring Python API integration and visual feedback.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
