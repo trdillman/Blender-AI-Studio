@@ -5,6 +5,28 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import cors from "cors";
 import fs from "fs";
+import { GoogleGenAI } from "@google/genai";
+
+type LlmProvider = "openai" | "anthropic" | "gemini";
+
+type ChatMessage = {
+  role: string;
+  content?: string;
+  tool_calls?: any[];
+  tool_call_id?: string;
+  name?: string;
+};
+
+type LlmChatRequest = {
+  provider?: LlmProvider;
+  model: string;
+  apiKey?: string;
+  baseUrl?: string;
+  messages: ChatMessage[];
+  tools?: any[];
+  systemInstruction?: string;
+  stream?: boolean;
+};
 
 async function startServer() {
   const app = express();
@@ -83,6 +105,294 @@ async function startServer() {
   });
 
   // API Routes
+  const writeSse = (res: express.Response, event: string, data: any) => {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  const setupSse = (res: express.Response) => {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders();
+  };
+
+  const parseSseStream = async (
+    response: Response,
+    onEvent: (eventName: string, payload: any) => void
+  ) => {
+    const reader = response.body?.getReader();
+    if (!reader) return;
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let currentEvent = "message";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const chunks = buffer.split("\n\n");
+      buffer = chunks.pop() || "";
+
+      for (const chunk of chunks) {
+        const lines = chunk.split("\n");
+        let data = "";
+        currentEvent = "message";
+
+        for (const line of lines) {
+          if (line.startsWith("event:")) {
+            currentEvent = line.slice(6).trim();
+          } else if (line.startsWith("data:")) {
+            data += line.slice(5).trim();
+          }
+        }
+
+        if (!data || data === "[DONE]") continue;
+        try {
+          onEvent(currentEvent, JSON.parse(data));
+        } catch {
+          // Best-effort stream parsing
+        }
+      }
+    }
+  };
+
+  app.post("/api/llm/chat", async (req, res) => {
+    const body = req.body as LlmChatRequest;
+    const provider: LlmProvider = body.provider || "gemini";
+    const stream = !!body.stream;
+
+    const emitFallbackResponse = async (reason: string) => {
+      const result = await runNonStreamingChat(body);
+      writeSse(res, "fallback", { reason });
+      writeSse(res, "result", result);
+      writeSse(res, "done", {});
+      res.end();
+    };
+
+    const runNonStreamingChat = async (request: LlmChatRequest) => {
+      if (provider === "gemini") {
+        const ai = new GoogleGenAI({ apiKey: request.apiKey || process.env.GEMINI_API_KEY || "" });
+        const result = await ai.models.generateContent({
+          model: request.model,
+          contents: request.messages.map((m) => ({
+            role: m.role === "assistant" ? "model" : m.role,
+            parts: [{ text: m.content || "" }]
+          })),
+          config: {
+            systemInstruction: request.systemInstruction,
+            tools: request.tools
+          }
+        });
+        return {
+          text: result.text || "",
+          toolCalls: result.functionCalls || []
+        };
+      }
+
+      if (provider === "anthropic") {
+        const baseUrl = request.baseUrl || "https://api.anthropic.com";
+        const response = await fetch(`${baseUrl}/v1/messages`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-api-key": request.apiKey || process.env.ANTHROPIC_API_KEY || "",
+            "anthropic-version": "2023-06-01"
+          },
+          body: JSON.stringify({
+            model: request.model,
+            messages: request.messages
+              .filter((m) => m.role === "user" || m.role === "assistant")
+              .map((m) => ({ role: m.role, content: m.content || "" })),
+            system: request.systemInstruction,
+            tools: request.tools
+          })
+        });
+        const payload = await response.json();
+        const text = (payload.content || [])
+          .filter((item: any) => item.type === "text")
+          .map((item: any) => item.text)
+          .join("");
+        const toolCalls = (payload.content || [])
+          .filter((item: any) => item.type === "tool_use")
+          .map((item: any) => ({ id: item.id, name: item.name, args: item.input }));
+        return { text, toolCalls };
+      }
+
+      const baseUrl = body.baseUrl || "https://api.openai.com";
+      const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${body.apiKey || process.env.OPENAI_API_KEY || ""}`
+        },
+        body: JSON.stringify({
+          model: body.model,
+          messages: body.messages.map((m) => ({
+            role: m.role === "model" ? "assistant" : m.role,
+            content: m.content || ""
+          })),
+          tools: body.tools
+        })
+      });
+      const payload = await response.json();
+      const message = payload.choices?.[0]?.message || {};
+      return { text: message.content || "", toolCalls: message.tool_calls || [] };
+    };
+
+    try {
+      if (!stream) {
+        const result = await runNonStreamingChat(body);
+        return res.json(result);
+      }
+
+      setupSse(res);
+
+      if (provider === "gemini") {
+        try {
+          const ai = new GoogleGenAI({ apiKey: body.apiKey || process.env.GEMINI_API_KEY || "" });
+          const geminiStream = await ai.models.generateContentStream({
+            model: body.model,
+            contents: body.messages.map((m) => ({
+              role: m.role === "assistant" ? "model" : m.role,
+              parts: [{ text: m.content || "" }]
+            })),
+            config: {
+              systemInstruction: body.systemInstruction,
+              tools: body.tools
+            }
+          });
+
+          let emittedText = "";
+          for await (const chunk of geminiStream) {
+            const text = chunk.text || "";
+            if (text) {
+              emittedText += text;
+              writeSse(res, "text-delta", { textDelta: text, text: emittedText });
+            }
+            const calls = chunk.functionCalls || [];
+            if (calls.length > 0) {
+              writeSse(res, "tool-call", { toolCalls: calls });
+            }
+          }
+          writeSse(res, "done", {});
+          return res.end();
+        } catch {
+          return emitFallbackResponse("Gemini streaming unavailable");
+        }
+      }
+
+      if (provider === "openai") {
+        const baseUrl = body.baseUrl || "https://api.openai.com";
+        try {
+          const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              authorization: `Bearer ${body.apiKey || process.env.OPENAI_API_KEY || ""}`
+            },
+            body: JSON.stringify({
+              model: body.model,
+              stream: true,
+              messages: body.messages.map((m) => ({
+                role: m.role === "model" ? "assistant" : m.role,
+                content: m.content || ""
+              })),
+              tools: body.tools
+            })
+          });
+
+          let accumulatedText = "";
+          const toolCallMap = new Map<number, any>();
+          await parseSseStream(response, (_event, payload) => {
+            const delta = payload.choices?.[0]?.delta;
+            if (!delta) return;
+            if (delta.content) {
+              accumulatedText += delta.content;
+              writeSse(res, "text-delta", { textDelta: delta.content, text: accumulatedText });
+            }
+            if (delta.tool_calls) {
+              for (const tc of delta.tool_calls) {
+                const existing = toolCallMap.get(tc.index) || { id: tc.id, function: { name: "", arguments: "" } };
+                if (tc.id) existing.id = tc.id;
+                if (tc.function?.name) existing.function.name = tc.function.name;
+                if (tc.function?.arguments) existing.function.arguments += tc.function.arguments;
+                toolCallMap.set(tc.index, existing);
+              }
+              writeSse(res, "tool-call", { toolCalls: Array.from(toolCallMap.values()) });
+            }
+          });
+          writeSse(res, "done", {});
+          return res.end();
+        } catch {
+          return emitFallbackResponse("OpenAI-compatible streaming unavailable");
+        }
+      }
+
+      if (provider === "anthropic") {
+        const baseUrl = body.baseUrl || "https://api.anthropic.com";
+        try {
+          const response = await fetch(`${baseUrl}/v1/messages`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-api-key": body.apiKey || process.env.ANTHROPIC_API_KEY || "",
+              "anthropic-version": "2023-06-01"
+            },
+            body: JSON.stringify({
+              model: body.model,
+              system: body.systemInstruction,
+              stream: true,
+              messages: body.messages
+                .filter((m) => m.role === "user" || m.role === "assistant")
+                .map((m) => ({ role: m.role, content: m.content || "" })),
+              tools: body.tools
+            })
+          });
+
+          const toolUses = new Map<string, any>();
+          await parseSseStream(response, (event, payload) => {
+            if (event === "content_block_delta" && payload.delta?.type === "text_delta") {
+              writeSse(res, "text-delta", { textDelta: payload.delta.text });
+            }
+            if (event === "content_block_start" && payload.content_block?.type === "tool_use") {
+              toolUses.set(payload.index, {
+                id: payload.content_block.id,
+                name: payload.content_block.name,
+                args: {}
+              });
+              writeSse(res, "tool-call", { toolCalls: Array.from(toolUses.values()) });
+            }
+            if (event === "content_block_delta" && payload.delta?.type === "input_json_delta") {
+              const existing = toolUses.get(payload.index);
+              if (existing) {
+                existing.argsRaw = (existing.argsRaw || "") + (payload.delta.partial_json || "");
+                writeSse(res, "tool-call", { toolCalls: Array.from(toolUses.values()) });
+              }
+            }
+          });
+          writeSse(res, "done", {});
+          return res.end();
+        } catch {
+          return emitFallbackResponse("Anthropic-compatible streaming unavailable");
+        }
+      }
+
+      writeSse(res, "error", { message: `Unsupported provider: ${provider}` });
+      writeSse(res, "done", {});
+      res.end();
+    } catch (error) {
+      if (stream) {
+        writeSse(res, "error", { message: String(error) });
+        writeSse(res, "done", {});
+        return res.end();
+      }
+      res.status(500).json({ error: String(error) });
+    }
+  });
+
   app.get("/api/status", (req, res) => {
     res.json({ blenderConnected: isBlenderConnected });
   });

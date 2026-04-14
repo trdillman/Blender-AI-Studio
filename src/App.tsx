@@ -21,7 +21,8 @@ import {
   Check
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { ai, BLENDER_TOOLS, SYSTEM_INSTRUCTION } from './services/geminiService';
+import { BLENDER_TOOLS, SYSTEM_INSTRUCTION } from './services/geminiService';
+import { streamLlmContent, LlmToolCall } from './services/llmService';
 import Markdown from 'react-markdown';
 
 interface Message {
@@ -29,6 +30,9 @@ interface Message {
   content?: string;
   parts?: any[];
 }
+
+const LLM_PROVIDER = (import.meta.env.VITE_LLM_PROVIDER || 'gemini') as 'gemini' | 'openai' | 'anthropic';
+const LLM_MODEL = import.meta.env.VITE_LLM_MODEL || 'gemini-2.5-pro';
 
 export default function App() {
   const [messages, setMessages] = useState<Message[]>([
@@ -259,8 +263,8 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const executeToolInBlender = async (tool: string, args: any) => {
-    return new Promise(async (resolve) => {
+  const executeToolInBlender = async (tool: string, args: any): Promise<any> => {
+    return new Promise<any>(async (resolve) => {
       try {
         const { db } = await import('./firebase');
         const { doc, setDoc, onSnapshot } = await import('firebase/firestore');
@@ -303,40 +307,98 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
   const handleSend = async () => {
     if (!input.trim() || isTyping) return;
 
+    const normalizeToolCalls = (toolCalls: LlmToolCall[]) => {
+      return toolCalls
+        .map((call) => {
+          const name = call.name || call.function?.name;
+          let args: any = call.args || {};
+          if (!call.args && call.function?.arguments) {
+            try {
+              args = JSON.parse(call.function.arguments);
+            } catch {
+              args = {};
+            }
+          }
+          if (!call.args && call.argsRaw) {
+            try {
+              args = JSON.parse(call.argsRaw);
+            } catch {
+              args = {};
+            }
+          }
+          if (!name) return null;
+          return { name, args, id: call.id };
+        })
+        .filter(Boolean) as Array<{ name: string; args: any; id?: string }>;
+    };
+
     const userMsg: Message = { role: 'user', content: input };
-    setMessages(prev => [...prev, userMsg]);
+    const assistantIndex = messages.length + 1;
+    setMessages(prev => [...prev, userMsg, { role: 'model', content: '' }]);
     setInput('');
     setIsTyping(true);
 
     try {
-      let currentHistory: any[] = messages
-        .filter(m => m.content || m.parts)
-        .map(m => {
-          if (m.parts) return { role: m.role, parts: m.parts };
-          return { role: m.role, parts: [{ text: m.content }] };
-        });
-        
-      currentHistory.push({ role: 'user', parts: [{ text: input }] });
+      let currentHistory: Array<{ role: string; content: string }> = messages
+        .filter(m => m.content)
+        .map(m => ({
+          role: m.role === 'model' ? 'assistant' : m.role,
+          content: m.content || ''
+        }));
+      currentHistory.push({ role: 'user', content: input });
 
-      let response = await ai.models.generateContent({
-        model: "gemini-2.5-pro",
-        contents: currentHistory,
-        config: {
-          systemInstruction: SYSTEM_INSTRUCTION,
-          tools: [{ functionDeclarations: BLENDER_TOOLS }]
-        }
-      });
-      
-      while (response.functionCalls && response.functionCalls.length > 0) {
+      let assistantText = '';
+
+      const runStreamingTurn = async () => {
+        return streamLlmContent(
+          {
+            provider: LLM_PROVIDER,
+            model: LLM_MODEL,
+            messages: currentHistory,
+            systemInstruction: SYSTEM_INSTRUCTION,
+            tools: LLM_PROVIDER === 'gemini'
+              ? [{ functionDeclarations: BLENDER_TOOLS }]
+              : BLENDER_TOOLS.map((tool) => ({
+                  type: 'function',
+                  function: {
+                    name: tool.name,
+                    description: tool.description,
+                    parameters: tool.parameters
+                  }
+                }))
+          },
+          {
+            onTextDelta: (delta) => {
+              assistantText += delta;
+              setMessages(prev =>
+                prev.map((msg, index) =>
+                  index === assistantIndex ? { ...msg, content: assistantText } : msg
+                )
+              );
+            },
+            onToolCalls: (toolCalls) => {
+              const normalized = normalizeToolCalls(toolCalls);
+              if (normalized.length > 0) {
+                const callNames = normalized.map(c => c.name).join(', ');
+                setLogs(prev => [...prev, `[tool-call chunk] ${callNames}`].slice(-50));
+              }
+            },
+            onFallback: (reason) => {
+              setLogs(prev => [...prev, `[stream fallback] ${reason}`].slice(-50));
+            }
+          }
+        );
+      };
+
+      let response = await runStreamingTurn();
+      let normalizedCalls = normalizeToolCalls(response.toolCalls);
+
+      while (normalizedCalls.length > 0) {
         const functionResponses = [];
-        
-        // Append the model's function calls to history
-        currentHistory.push({
-          role: 'model',
-          parts: response.functionCalls.map(call => ({ functionCall: call }))
-        });
-        
-        for (const call of response.functionCalls) {
+
+        currentHistory.push({ role: 'assistant', content: assistantText });
+
+        for (const call of normalizedCalls) {
           if (call.name === 'execute_python') {
             setPythonCode((call.args as any).code);
             setActiveTab('code');
@@ -353,36 +415,23 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
           }
           
           functionResponses.push({
-            functionResponse: {
-              name: call.name,
-              response: result
-            }
+            role: 'tool',
+            content: JSON.stringify(result),
+            name: call.name
           });
         }
-        
-        // Append the function responses to history
-        currentHistory.push({
-          role: 'function',
-          parts: functionResponses
-        });
-        
-        // Call Gemini again with the results
-        response = await ai.models.generateContent({
-          model: "gemini-2.5-pro",
-          contents: currentHistory,
-          config: {
-            systemInstruction: SYSTEM_INSTRUCTION,
-            tools: [{ functionDeclarations: BLENDER_TOOLS }]
-          }
-        });
-      }
 
-      if (response.text) {
-        setMessages(prev => [...prev, { role: 'model', content: response.text }]);
+        currentHistory.push(...(functionResponses as any));
+        response = await runStreamingTurn();
+        normalizedCalls = normalizeToolCalls(response.toolCalls);
       }
     } catch (error) {
       console.error(error);
-      setMessages(prev => [...prev, { role: 'model', content: 'Error connecting to Gemini or Blender.' }]);
+      setMessages(prev =>
+        prev.map((msg, index) =>
+          index === assistantIndex ? { ...msg, content: 'Error connecting to LLM provider or Blender.' } : msg
+        )
+      );
     } finally {
       setIsTyping(false);
     }
