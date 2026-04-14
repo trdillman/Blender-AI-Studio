@@ -1,0 +1,10 @@
+[project]
+name = "blender-ai-studio"
+version = "0.1.0"
+description = "Shared Codex App and Codex Cloud workflow with optional MCP bridge."
+requires-python = ">=3.11"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

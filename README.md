@@ -18,3 +18,16 @@ View your app in AI Studio: https://ai.studio/apps/51bfcdd8-6bd6-4c4d-88f5-2583c
 2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
 3. Run the app:
    `npm run dev`
+
+
+<!-- codex-managed:start -->
+# Codex Workflow
+
+## Codex Workflow
+
+- GitHub is the source of truth for Codex App and Codex Cloud work.
+- Local Blender GUI work stays local.
+- Cloud work stays headless-safe by default.
+- `REMOTE_MCP_GATEWAY_URL` is optional and can point at the already-exposed MCP endpoint for local helper tools.
+
+<!-- codex-managed:end -->
