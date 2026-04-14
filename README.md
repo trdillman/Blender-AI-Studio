@@ -19,6 +19,16 @@ View your app in AI Studio: https://ai.studio/apps/51bfcdd8-6bd6-4c4d-88f5-2583c
 3. Run the app:
    `npm run dev`
 
+## Screenshot tooling (for Codex sessions)
+
+This repo now includes a built-in screenshot tool so future Codex sessions can capture UI evidence without relying on external browser tooling.
+
+1. Install Chromium once:
+   `npm run screenshot:install`
+2. Start the app:
+   `npm run dev`
+3. Capture a screenshot:
+   `npm run screenshot -- --url http://127.0.0.1:3000 --out artifacts/setup-ui.png`
 
 <!-- codex-managed:start -->
 # Codex Workflow
