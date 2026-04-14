@@ -1,6 +1,5 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
-  Send, 
   Box, 
   Code, 
   Image as ImageIcon, 
@@ -14,7 +13,6 @@ import {
   Plus,
   Search,
   User,
-  Sparkles,
   Monitor,
   Download,
   Copy,
@@ -22,7 +20,8 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { ai, BLENDER_TOOLS, SYSTEM_INSTRUCTION } from './services/geminiService';
-import Markdown from 'react-markdown';
+import { ChatSurface } from './components/chat/ChatSurface';
+import { sanitizeToolPayload } from './components/chat/adapters';
 
 interface Message {
   role: 'user' | 'model' | 'function';
@@ -34,7 +33,6 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([
     { role: 'model', content: 'Welcome to Blender AI Studio. I have direct access to your Blender 5.1 instance via Firebase. How can I help you build today?' }
   ]);
-  const [input, setInput] = useState('');
   const [isBlenderConnected, setIsBlenderConnected] = useState(false);
   const [isTyping, setIsTyping] = useState(false);
   const [activeTab, setActiveTab] = useState<'viewport' | 'code' | 'logs' | 'setup'>('setup');
@@ -44,7 +42,6 @@ export default function App() {
   const [sessionId] = useState(() => Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15));
   const [copied, setCopied] = useState(false);
   
-  const chatEndRef = useRef<HTMLDivElement>(null);
 
   const agentScript = `import bpy
 import json
@@ -249,18 +246,14 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
     });
   }, [sessionId, activeTab]);
 
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
-
   const handleCopyScript = () => {
     navigator.clipboard.writeText(agentScript);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const executeToolInBlender = async (tool: string, args: any) => {
-    return new Promise(async (resolve) => {
+  const executeToolInBlender = async (tool: string, args: any): Promise<any> => {
+    return new Promise<any>(async (resolve) => {
       try {
         const { db } = await import('./firebase');
         const { doc, setDoc, onSnapshot } = await import('firebase/firestore');
@@ -300,12 +293,11 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
     });
   };
 
-  const handleSend = async () => {
-    if (!input.trim() || isTyping) return;
+  const handleSend = async (inputValue: string) => {
+    if (!inputValue.trim() || isTyping) return;
 
-    const userMsg: Message = { role: 'user', content: input };
+    const userMsg: Message = { role: 'user', content: inputValue };
     setMessages(prev => [...prev, userMsg]);
-    setInput('');
     setIsTyping(true);
 
     try {
@@ -316,7 +308,7 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
           return { role: m.role, parts: [{ text: m.content }] };
         });
         
-      currentHistory.push({ role: 'user', parts: [{ text: input }] });
+      currentHistory.push({ role: 'user', parts: [{ text: inputValue }] });
 
       let response = await ai.models.generateContent({
         model: "gemini-2.5-pro",
@@ -337,6 +329,12 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
         });
         
         for (const call of response.functionCalls) {
+          setMessages(prev => [...prev, {
+            role: 'function',
+            parts: [{ functionCall: call }],
+            content: `Running tool: ${call.name}`
+          }]);
+
           if (call.name === 'execute_python') {
             setPythonCode((call.args as any).code);
             setActiveTab('code');
@@ -351,6 +349,17 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
           if (call.name === 'execute_python' && result?.output) {
              setLogs(prev => [...prev, result.output].slice(-50));
           }
+
+          setMessages(prev => [...prev, {
+            role: 'function',
+            parts: [{
+              functionResponse: {
+                name: call.name,
+                response: result
+              }
+            }],
+            content: `Tool result (${call.name}): ${JSON.stringify(sanitizeToolPayload(result), null, 2)}`
+          }]);
           
           functionResponses.push({
             functionResponse: {
@@ -460,68 +469,7 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
         {/* Workspace */}
         <div className="flex-1 flex overflow-hidden">
           {/* Chat Panel */}
-          <div className="w-[450px] flex flex-col border-r border-[#222] bg-[#0a0a0a]">
-            <div className="flex-1 overflow-y-auto p-6 space-y-6 scrollbar-hide">
-              {messages.map((msg, i) => {
-                if (!msg.content) return null;
-                return (
-                  <div key={i} className={`flex gap-4 ${msg.role === 'user' ? 'justify-end' : ''}`}>
-                    {msg.role === 'model' && (
-                      <div className="w-8 h-8 rounded-full bg-[#3b82f6]/10 flex items-center justify-center flex-shrink-0">
-                        <Sparkles className="w-4 h-4 text-[#3b82f6]" />
-                      </div>
-                    )}
-                    <div className={`max-w-[85%] rounded-2xl p-4 text-sm leading-relaxed ${
-                      msg.role === 'user' 
-                        ? 'bg-[#3b82f6] text-white' 
-                        : 'bg-[#1a1a1a] border border-[#333] text-[#e0e0e0]'
-                    }`}>
-                      <div className="prose prose-invert prose-sm max-w-none">
-                        <Markdown>
-                          {msg.content}
-                        </Markdown>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-              {isTyping && (
-                <div className="flex gap-4">
-                  <div className="w-8 h-8 rounded-full bg-[#3b82f6]/10 flex items-center justify-center">
-                    <Sparkles className="w-4 h-4 text-[#3b82f6] animate-pulse" />
-                  </div>
-                  <div className="bg-[#1a1a1a] border border-[#333] rounded-2xl p-4 flex gap-1">
-                    <div className="w-1.5 h-1.5 bg-[#444] rounded-full animate-bounce" />
-                    <div className="w-1.5 h-1.5 bg-[#444] rounded-full animate-bounce [animation-delay:0.2s]" />
-                    <div className="w-1.5 h-1.5 bg-[#444] rounded-full animate-bounce [animation-delay:0.4s]" />
-                  </div>
-                </div>
-              )}
-              <div ref={chatEndRef} />
-            </div>
-
-            <div className="p-4 border-t border-[#222]">
-              <div className="relative">
-                <textarea
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), handleSend())}
-                  placeholder="Ask Gemini to build in Blender..."
-                  className="w-full bg-[#1a1a1a] border border-[#333] rounded-xl py-3 pl-4 pr-12 text-sm focus:outline-none focus:border-[#3b82f6] transition-colors resize-none min-h-[100px]"
-                />
-                <button 
-                  onClick={handleSend}
-                  disabled={!input.trim() || isTyping}
-                  className="absolute right-3 bottom-3 p-2 bg-[#3b82f6] disabled:bg-[#222] text-white rounded-lg transition-all hover:scale-105 active:scale-95"
-                >
-                  <Send className="w-4 h-4" />
-                </button>
-              </div>
-              <div className="mt-2 text-[10px] text-[#555] text-center">
-                Gemini can control Blender 5.1 via Python. Results may vary based on scene complexity.
-              </div>
-            </div>
-          </div>
+          <ChatSurface messages={messages} isTyping={isTyping} onSend={handleSend} />
 
           {/* Preview Panel */}
           <div className="flex-1 flex flex-col bg-[#050505]">

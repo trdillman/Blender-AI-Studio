@@ -12,10 +12,12 @@
     "start": "node server.ts"
   },
   "dependencies": {
+    "@ai-sdk/react": "^3.0.161",
     "@google/genai": "^1.29.0",
     "@tailwindcss/vite": "^4.1.14",
     "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "^5.0.4",
+    "ai-elements": "^1.9.0",
     "clsx": "^2.1.1",
     "cors": "^2.8.6",
     "dotenv": "^17.2.3",
