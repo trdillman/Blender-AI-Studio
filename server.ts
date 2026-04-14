@@ -6,6 +6,21 @@ import { createServer as createViteServer } from "vite";
 import cors from "cors";
 import fs from "fs";
 
+type ProviderName = "openai" | "anthropic" | "gemini" | "lmstudio";
+
+function trimTrailingSlash(value: string): string {
+  return value.replace(/\/+$/, "");
+}
+
+function isValidHttpUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 async function startServer() {
   const app = express();
   const server = createServer(app);
@@ -85,6 +100,78 @@ async function startServer() {
   // API Routes
   app.get("/api/status", (req, res) => {
     res.json({ blenderConnected: isBlenderConnected });
+  });
+
+  app.post("/api/providers/test", async (req, res) => {
+    const { provider, apiKey, baseUrl, model } = req.body as {
+      provider?: ProviderName;
+      apiKey?: string;
+      baseUrl?: string;
+      model?: string;
+    };
+
+    if (!provider || !["openai", "anthropic", "gemini", "lmstudio"].includes(provider)) {
+      return res.status(400).json({ ok: false, error: "Invalid provider." });
+    }
+
+    if (!model || !String(model).trim()) {
+      return res.status(400).json({ ok: false, error: "Model is required." });
+    }
+
+    if (!baseUrl || !isValidHttpUrl(baseUrl)) {
+      return res.status(400).json({ ok: false, error: "A valid base URL is required." });
+    }
+
+    if (["openai", "anthropic", "gemini"].includes(provider) && !String(apiKey || "").trim()) {
+      return res.status(400).json({ ok: false, error: `${provider} API key is required.` });
+    }
+
+    try {
+      const normalizedBaseUrl = trimTrailingSlash(baseUrl);
+      let response: Response;
+
+      if (provider === "openai" || provider === "lmstudio") {
+        const headers: Record<string, string> = {};
+        if (apiKey?.trim()) {
+          headers.Authorization = `Bearer ${apiKey.trim()}`;
+        }
+        response = await fetch(`${normalizedBaseUrl}/models`, { method: "GET", headers });
+      } else if (provider === "anthropic") {
+        response = await fetch(normalizedBaseUrl, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-api-key": String(apiKey).trim(),
+            "anthropic-version": "2023-06-01"
+          },
+          body: JSON.stringify({
+            model: String(model).trim(),
+            max_tokens: 1,
+            messages: [{ role: "user", content: "ping" }]
+          })
+        });
+      } else {
+        const endpoint = `${normalizedBaseUrl}/models/${encodeURIComponent(String(model).trim())}:generateContent?key=${encodeURIComponent(String(apiKey).trim())}`;
+        response = await fetch(endpoint, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ contents: [{ parts: [{ text: "ping" }] }] })
+        });
+      }
+
+      if (!response.ok) {
+        const text = await response.text();
+        return res.status(response.status).json({
+          ok: false,
+          error: text.slice(0, 300) || `Provider test failed with status ${response.status}.`
+        });
+      }
+
+      return res.json({ ok: true, message: "Connection successful." });
+    } catch (error) {
+      console.error("Provider connection test failed:", error);
+      return res.status(502).json({ ok: false, error: "Unable to reach the provider endpoint." });
+    }
   });
 
   // Serve the python agent script for easy downloading

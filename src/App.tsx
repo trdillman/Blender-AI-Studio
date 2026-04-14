@@ -18,11 +18,15 @@ import {
   Monitor,
   Download,
   Copy,
-  Check
+  Check,
+  Eye,
+  EyeOff
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { ai, BLENDER_TOOLS, SYSTEM_INSTRUCTION } from './services/geminiService';
 import Markdown from 'react-markdown';
+import { ProviderId, PROVIDER_DEFINITIONS } from './services/providerConfig';
+import { hydrateProviderSettings, persistProviderSettings, validateProviderSettings } from './services/providerSettingsService';
 
 interface Message {
   role: 'user' | 'model' | 'function';
@@ -30,7 +34,28 @@ interface Message {
   parts?: any[];
 }
 
+type ProviderErrors = {
+  apiKey?: string;
+  model?: string;
+  baseUrl?: string;
+};
+
+type ToastState = {
+  type: 'success' | 'error';
+  message: string;
+} | null;
+
 export default function App() {
+  const [provider, setProvider] = useState<ProviderId>(() => hydrateProviderSettings().provider);
+  const [model, setModel] = useState(() => hydrateProviderSettings().model);
+  const [baseUrl, setBaseUrl] = useState(() => hydrateProviderSettings().baseUrl);
+  const [apiKey, setApiKey] = useState('');
+  const [showApiKey, setShowApiKey] = useState(false);
+  const [providerErrors, setProviderErrors] = useState<ProviderErrors>({});
+  const [isTestingProvider, setIsTestingProvider] = useState(false);
+  const [providerStatus, setProviderStatus] = useState<string | null>(null);
+  const [providerStatusType, setProviderStatusType] = useState<'success' | 'error' | null>(null);
+  const [toast, setToast] = useState<ToastState>(null);
   const [messages, setMessages] = useState<Message[]>([
     { role: 'model', content: 'Welcome to Blender AI Studio. I have direct access to your Blender 5.1 instance via Firebase. How can I help you build today?' }
   ]);
@@ -253,10 +278,65 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  useEffect(() => {
+    persistProviderSettings({ provider, model, baseUrl });
+  }, [provider, model, baseUrl]);
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = window.setTimeout(() => setToast(null), 4000);
+    return () => window.clearTimeout(timer);
+  }, [toast]);
+
   const handleCopyScript = () => {
     navigator.clipboard.writeText(agentScript);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const pushStatus = (type: 'success' | 'error', message: string) => {
+    setProviderStatusType(type);
+    setProviderStatus(message);
+    setToast({ type, message });
+  };
+
+  const handleProviderChange = (nextProvider: ProviderId) => {
+    const defaults = PROVIDER_DEFINITIONS[nextProvider];
+    setProvider(nextProvider);
+    setModel(defaults.defaultModel);
+    setBaseUrl(defaults.defaultBaseUrl);
+    setProviderErrors({});
+    setProviderStatus(null);
+    setProviderStatusType(null);
+  };
+
+  const handleTestConnection = async () => {
+    const nextErrors = validateProviderSettings({ provider, model, baseUrl }, apiKey);
+    setProviderErrors(nextErrors);
+    if (Object.keys(nextErrors).length > 0) {
+      pushStatus('error', 'Fix validation errors before testing the connection.');
+      return;
+    }
+
+    setIsTestingProvider(true);
+    try {
+      const response = await fetch('/api/providers/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider, model, baseUrl, apiKey })
+      });
+      const data = await response.json();
+      if (!response.ok || !data.ok) {
+        pushStatus('error', data?.error || 'Connection test failed.');
+        return;
+      }
+      pushStatus('success', data?.message || 'Connection successful.');
+    } catch (error) {
+      console.error('Provider test failed:', error);
+      pushStatus('error', 'Unable to reach the backend test endpoint.');
+    } finally {
+      setIsTestingProvider(false);
+    }
   };
 
   const executeToolInBlender = async (tool: string, args: any) => {
@@ -342,7 +422,7 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
             setActiveTab('code');
           }
           
-          const result = await executeToolInBlender(call.name, call.args);
+          const result: any = await executeToolInBlender(call.name, call.args);
           
           if (call.name === 'take_screenshot' && result?.image) {
              setLastScreenshot(result.image);
@@ -624,6 +704,95 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
                     className="absolute inset-0 p-8 overflow-auto bg-[#0a0a0a]"
                   >
                     <div className="max-w-2xl mx-auto space-y-6">
+                      <div className="border border-[#222] rounded-xl p-5 bg-[#0f0f0f] space-y-4">
+                        <h3 className="text-sm font-semibold text-[#e0e0e0]">AI Provider Setup</h3>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                          <label className="text-xs space-y-1">
+                            <span className="text-[#888]">Provider</span>
+                            <select
+                              value={provider}
+                              onChange={(e) => handleProviderChange(e.target.value as ProviderId)}
+                              className="w-full bg-[#111] border border-[#333] rounded-md p-2 text-sm focus:outline-none focus:border-[#3b82f6]"
+                            >
+                              {Object.values(PROVIDER_DEFINITIONS).map((definition) => (
+                                <option key={definition.id} value={definition.id}>
+                                  {definition.label}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <label className="text-xs space-y-1">
+                            <span className="text-[#888]">Model</span>
+                            <input
+                              value={model}
+                              onChange={(e) => setModel(e.target.value)}
+                              className={`w-full bg-[#111] border rounded-md p-2 text-sm focus:outline-none ${
+                                providerErrors.model ? 'border-red-500' : 'border-[#333] focus:border-[#3b82f6]'
+                              }`}
+                              placeholder="Model name"
+                            />
+                            {providerErrors.model && <span className="text-red-400">{providerErrors.model}</span>}
+                          </label>
+                        </div>
+
+                        <label className="text-xs space-y-1 block">
+                          <span className="text-[#888]">Base URL</span>
+                          <input
+                            value={baseUrl}
+                            onChange={(e) => setBaseUrl(e.target.value)}
+                            className={`w-full bg-[#111] border rounded-md p-2 text-sm focus:outline-none ${
+                              providerErrors.baseUrl ? 'border-red-500' : 'border-[#333] focus:border-[#3b82f6]'
+                            }`}
+                            placeholder="https://..."
+                          />
+                          {providerErrors.baseUrl && <span className="text-red-400">{providerErrors.baseUrl}</span>}
+                        </label>
+
+                        <label className="text-xs space-y-1 block">
+                          <span className="text-[#888]">API Key</span>
+                          <div className="relative">
+                            <input
+                              type={showApiKey ? 'text' : 'password'}
+                              value={apiKey}
+                              onChange={(e) => setApiKey(e.target.value)}
+                              className={`w-full bg-[#111] border rounded-md p-2 pr-10 text-sm focus:outline-none ${
+                                providerErrors.apiKey ? 'border-red-500' : 'border-[#333] focus:border-[#3b82f6]'
+                              }`}
+                              placeholder={provider === 'lmstudio' ? 'Optional for local servers' : 'Paste API key'}
+                            />
+                            <button
+                              type="button"
+                              onClick={() => setShowApiKey(prev => !prev)}
+                              className="absolute right-2 top-1/2 -translate-y-1/2 text-[#777] hover:text-[#ddd]"
+                              title={showApiKey ? 'Hide API key' : 'Reveal API key'}
+                            >
+                              {showApiKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                            </button>
+                          </div>
+                          {providerErrors.apiKey && <span className="text-red-400">{providerErrors.apiKey}</span>}
+                        </label>
+
+                        <div className="text-xs text-[#888] border border-[#222] rounded-md p-3 bg-[#0c0c0c]">
+                          {PROVIDER_DEFINITIONS[provider].helperText}
+                        </div>
+
+                        <div className="flex items-center gap-3">
+                          <button
+                            type="button"
+                            onClick={handleTestConnection}
+                            disabled={isTestingProvider}
+                            className="px-3 py-2 rounded-md text-xs font-medium bg-[#3b82f6] hover:bg-[#2563eb] disabled:bg-[#1f2937] text-white"
+                          >
+                            {isTestingProvider ? 'Testing...' : 'Test connection'}
+                          </button>
+                          {providerStatus && (
+                            <span className={`text-xs ${providerStatusType === 'success' ? 'text-green-400' : 'text-red-400'}`}>
+                              {providerStatus}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
                       <div className="flex items-center gap-4 border-b border-[#222] pb-6">
                         <div className="w-12 h-12 bg-[#3b82f6]/10 rounded-xl flex items-center justify-center">
                           <Box className="w-6 h-6 text-[#3b82f6]" />
@@ -680,6 +849,17 @@ print("Blender AI Agent started. Connected to Firebase Bridge (Non-blocking).")
           </div>
         </div>
       </div>
+      {toast && (
+        <div className="fixed top-4 right-4 z-50">
+          <div className={`px-4 py-2 rounded-md border text-sm shadow-lg ${
+            toast.type === 'success'
+              ? 'bg-green-900/60 border-green-500 text-green-200'
+              : 'bg-red-900/60 border-red-500 text-red-200'
+          }`}>
+            {toast.message}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
